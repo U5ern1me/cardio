@@ -11,6 +11,27 @@ import * as SecretHitlerHandler from "./games/secretHitler.js";
 import * as HanabiHandler from "./games/hanabi.js";
 import * as LoveLetterHandler from "./games/love_letter.js";
 import * as SpadesHandler from "./games/spades.js";
+import { logEvent, classifyError } from "./infra/logger.js";
+import { TokenBucket } from "./network/tokenBucket.js";
+import {
+  parseClientMessage,
+  parseServerEvent,
+  type ClientMessage,
+  type ServerEvent,
+} from "./protocol/schemas.js";
+import {
+  issueInviteToken,
+  issueReconnectToken,
+  issueSessionToken,
+  verifyToken,
+  type SessionRole,
+} from "./security/tokens.js";
+import {
+  deriveLifecycleFromState,
+  transitionLifecycle,
+  type SessionLifecycleState,
+} from "./sessionLifecycle.js";
+import { SessionOrchestrator } from "./sessionOrchestrator.js";
 import type { GameState as LiteratureState } from "../src/games/literature/types.js";
 import type { GameState as CoupState } from "../src/games/coup/types.js";
 import type { SecretHitlerState } from "../src/games/secretHitler/types.js";
@@ -18,6 +39,7 @@ import type { GameState as HanabiState } from "../src/games/hanabi/types.js";
 import type { GameState as LoveLetterState } from "../src/games/love_letter/types.js";
 import type { GameState as SpadesState } from "../src/games/spades/types.js";
 import type { BaseGameState, GameType, Move } from "../src/shared/types.js";
+import type { PersistedSessionEnvelope } from "./db.js";
 
 type GameStateUnion =
   | LiteratureState
@@ -55,12 +77,15 @@ const PORT = process.env.PORT || 3001;
 // ─── Constants ───────────────────────────────────────────
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const SESSION_CLEANUP_DELAY_MS = 120_000; // 2 minutes after last client leaves
-const INACTIVITY_CHECK_INTERVAL_MS = 5_000;
+const ORCHESTRATOR_TICK_INTERVAL_MS = 1_000;
 const INACTIVITY_TIMEOUT_MS = 60_000;
-const RATE_LIMIT_WINDOW_MS = 1_000;
-const MAX_MESSAGES_PER_WINDOW = 20;
+const DISCONNECT_GRACE_MS = 1_500;
+const RATE_LIMIT_BUCKET_CAPACITY = 30;
+const RATE_LIMIT_REFILL_PER_SECOND = 20;
 const MAX_WS_MESSAGE_BYTES = 64 * 1024;
 const MAX_MOVE_LOG_ENTRIES = 50;
+const CLIENT_MESSAGE_TTL_MS = 2 * 60 * 1000;
+const PENDING_JOIN_NONCE_TTL_MS = 20 * 60 * 1000;
 
 const MAX_PLAYERS: Record<string, number> = {
   LITERATURE: 8,
@@ -71,37 +96,22 @@ const MAX_PLAYERS: Record<string, number> = {
   SPADES: 4,
 };
 
-const SUPPORTED_MESSAGE_TYPES = new Set([
-  "CREATE_SESSION",
-  "JOIN_SESSION",
-  "JOIN_LOBBY",
-  "START_GAME",
-  "ASK_CARD",
-  "CLAIM_BOOK",
-  "COUP_ACTION",
-  "SECRET_HITLER_ACTION",
-  "PLACE_BID",
-  "PLAY_CARD",
-  "DISCARD_CARD",
-  "GIVE_HINT",
-  "MOVE_CARD",
-  "GAME_ACTION",
-  "HOST_ACTION",
-] as const);
-
 // ─── Types ───────────────────────────────────────────────
 interface Session {
   clients: Map<WebSocket, string>; // ws -> playerId
   state: GameStateUnion;
   gameType: GameType;
   hostPlayerId: string | null; // first player to join is host
-  cleanupTimer: ReturnType<typeof setTimeout> | null;
   lastActionTimestamp: number;
-}
-
-interface ClientMessage {
-  type: string;
-  [key: string]: unknown;
+  stateVersion: number;
+  lifecycleState: SessionLifecycleState;
+  lifecycleUpdatedAt: number;
+  lifecycleReason: string;
+  inviteToken: string;
+  processedMessageIds: Map<string, number>;
+  pendingJoinNonces: Map<string, number>;
+  validReconnectVersions: Record<string, number>;
+  connectionEpochByPlayer: Record<string, number>;
 }
 
 // Track which WS is alive for heartbeat
@@ -109,42 +119,151 @@ const wsAliveMap = new WeakMap<WebSocket, boolean>();
 
 const sessions: Record<string, Session> = {};
 
-// Load persisted sessions on startup
-const activeSessions = db.getAllSessions();
-for (const s of activeSessions) {
-  const state = s.state;
-  if (state.players) {
-    state.players.forEach((p: any) => (p.isConnected = false));
+function withDisconnectedPlayers(state: GameStateUnion): GameStateUnion {
+  if (!Array.isArray(state.players)) {
+    return state;
   }
-  sessions[s.id] = {
-    clients: new Map(),
-    state: state,
-    gameType: s.gameType as GameType,
-    hostPlayerId: s.hostPlayerId,
-    cleanupTimer: null,
-    lastActionTimestamp: Date.now(),
+  return {
+    ...state,
+    players: state.players.map((player) => ({
+      ...player,
+      isConnected: false,
+    })),
   };
-  ensureValidHost(sessions[s.id]);
 }
-console.log(`Loaded ${activeSessions.length} active sessions from DB.`);
+
+function restoreInviteToken(
+  sessionId: string,
+  persistedInviteToken?: string,
+): string {
+  if (persistedInviteToken) {
+    const tokenResult = verifyToken(persistedInviteToken, "invite");
+    if (tokenResult.ok && tokenResult.claims.sid === sessionId) {
+      return persistedInviteToken;
+    }
+  }
+  return issueInviteToken(sessionId);
+}
+
+function hydrateSessionFromEnvelope(envelope: PersistedSessionEnvelope): Session {
+  const state = withDisconnectedPlayers(envelope.state as GameStateUnion);
+  return {
+    clients: new Map(),
+    state,
+    gameType: envelope.gameType,
+    hostPlayerId: envelope.hostPlayerId,
+    lastActionTimestamp: envelope.lastActionTimestamp || Date.now(),
+    stateVersion: envelope.stateVersion || 0,
+    lifecycleState: "IDLE_EMPTY",
+    lifecycleUpdatedAt: Date.now(),
+    lifecycleReason: "session-restored",
+    inviteToken: restoreInviteToken(envelope.sessionId, envelope.inviteToken),
+    processedMessageIds: new Map(),
+    pendingJoinNonces: new Map(),
+    validReconnectVersions: envelope.validReconnectVersions ?? {},
+    connectionEpochByPlayer: envelope.connectionEpochByPlayer ?? {},
+  };
+}
+
+function restoreSessionsFromPersistence(trigger: string) {
+  const report = db.recoverAllSessions();
+  for (const sessionId of Object.keys(sessions)) {
+    delete sessions[sessionId];
+  }
+  for (const persistedSession of report.sessions) {
+    sessions[persistedSession.sessionId] = hydrateSessionFromEnvelope(
+      persistedSession,
+    );
+    ensureValidHost(sessions[persistedSession.sessionId]);
+  }
+
+  logEvent("info", "sessions.recovered", {
+    detail: trigger,
+    recoveredCount: report.sessions.length,
+    corruptedCount: report.corruptedSessionIds.length,
+    replayedFromEvents: report.replayedFromEvents,
+  });
+}
+
+restoreSessionsFromPersistence("startup");
 
 // ─── Helpers ─────────────────────────────────────────────
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
+function sendError(
+  ws: WebSocket,
+  message: string,
+  context: {
+    sessionId?: string;
+    playerId?: string | null;
+    messageType?: string;
+    reconnectTraceId?: string;
+  } = {},
+) {
+  logEvent("warn", "ws.error", {
+    sessionId: context.sessionId,
+    playerId: context.playerId ?? undefined,
+    messageType: context.messageType,
+    reconnectTraceId: context.reconnectTraceId,
+    errorClass: classifyError(message),
+    detail: message,
+  });
+  sendServerEvent(ws, { type: "ERROR", message });
 }
 
-function isValidGameType(value: unknown): value is GameType {
-  return typeof value === "string" && value in MAX_PLAYERS;
+function sendServerEvent(
+  ws: WebSocket,
+  event: ServerEvent,
+) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const parsed = parseServerEvent(event);
+  if (!parsed.ok) {
+    logEvent("error", "ws.invalid_server_event_blocked", {
+      errorClass: "SERVER_EVENT_SCHEMA",
+      detail: parsed.error,
+    });
+    return;
+  }
+  ws.send(JSON.stringify(parsed.data));
 }
 
-function isSupportedMessageType(value: string): boolean {
-  return SUPPORTED_MESSAGE_TYPES.has(value as any);
+function buildPersistedEnvelope(
+  sessionId: string,
+  session: Session,
+): PersistedSessionEnvelope {
+  return {
+    sessionId,
+    gameType: session.gameType,
+    state: session.state,
+    hostPlayerId: session.hostPlayerId,
+    stateVersion: session.stateVersion,
+    lifecycleState: session.lifecycleState,
+    lifecycleUpdatedAt: session.lifecycleUpdatedAt,
+    lifecycleReason: session.lifecycleReason,
+    lastActionTimestamp: session.lastActionTimestamp,
+    validReconnectVersions: session.validReconnectVersions,
+    connectionEpochByPlayer: session.connectionEpochByPlayer,
+    inviteToken: session.inviteToken,
+    persistedAtEpochMs: Date.now(),
+  };
 }
 
-function sendError(ws: WebSocket, message: string) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "ERROR", message }));
+function persistSessionState(sessionId: string, reason: string) {
+  const session = sessions[sessionId];
+  if (!session) {
+    return;
+  }
+  const persistenceResult = db.persistSessionSnapshot(
+    buildPersistedEnvelope(sessionId, session),
+    reason,
+  );
+  if (!persistenceResult.ok) {
+    logEvent("error", "session.persist_failed", {
+      sessionId,
+      errorClass: "PERSISTENCE_WRITE",
+      detail: persistenceResult.error,
+    });
   }
 }
 
@@ -220,6 +339,81 @@ function ensureValidHost(session: Session, previousHostId?: string | null) {
   session.hostPlayerId = selectNextHostPlayerId(session);
 }
 
+function transitionSessionLifecycle(
+  sessionId: string,
+  session: Session,
+  nextState: SessionLifecycleState,
+  reason: string,
+) {
+  const previousState = session.lifecycleState;
+  transitionLifecycle(session, nextState, reason);
+  if (previousState !== session.lifecycleState) {
+    logEvent("info", "session.lifecycle_transition", {
+      sessionId,
+      lifecycleState: `${previousState}->${session.lifecycleState}`,
+      lifecycleReason: reason,
+    });
+  }
+}
+
+function isMutatingMessageType(type: ClientMessage["type"]): boolean {
+  return (
+    type === "JOIN_LOBBY" ||
+    type === "START_GAME" ||
+    type === "ASK_CARD" ||
+    type === "CLAIM_BOOK" ||
+    type === "COUP_ACTION" ||
+    type === "SECRET_HITLER_ACTION" ||
+    type === "PLACE_BID" ||
+    type === "PLAY_CARD" ||
+    type === "DISCARD_CARD" ||
+    type === "GIVE_HINT" ||
+    type === "MOVE_CARD" ||
+    type === "GAME_ACTION" ||
+    type === "HOST_ACTION"
+  );
+}
+
+function pruneSessionCaches(session: Session) {
+  const now = Date.now();
+  for (const [messageId, timestamp] of session.processedMessageIds.entries()) {
+    if (now - timestamp > CLIENT_MESSAGE_TTL_MS) {
+      session.processedMessageIds.delete(messageId);
+    }
+  }
+  for (const [nonce, expiresAt] of session.pendingJoinNonces.entries()) {
+    if (expiresAt <= now) {
+      session.pendingJoinNonces.delete(nonce);
+    }
+  }
+}
+
+function markProcessedMessage(session: Session, messageId: string) {
+  pruneSessionCaches(session);
+  session.processedMessageIds.set(messageId, Date.now());
+}
+
+function hasProcessedMessage(session: Session, messageId: string): boolean {
+  pruneSessionCaches(session);
+  return session.processedMessageIds.has(messageId);
+}
+
+function ensureLifecycleForCurrentState(
+  sessionId: string,
+  session: Session,
+  reason: string,
+) {
+  if (session.lifecycleState === "ENDED") {
+    return;
+  }
+  const derived = deriveLifecycleFromState(session.state as BaseGameState);
+  transitionSessionLifecycle(sessionId, session, derived, reason);
+}
+
+function generatePlayerId(): string {
+  return crypto.randomBytes(6).toString("hex");
+}
+
 function generateSessionId(): string {
   let id: string;
   let attempts = 0;
@@ -235,26 +429,69 @@ function broadcastState(sessionId: string) {
   const session = sessions[sessionId];
   if (!session) return;
 
-  db.saveSession(
-    sessionId,
-    session.gameType,
-    session.state,
-    session.hostPlayerId,
-  );
+  pruneSessionCaches(session);
+  persistSessionState(sessionId, "broadcast-state");
 
   for (const [client, playerId] of session.clients.entries()) {
     if (client.readyState === WebSocket.OPEN) {
-      const sanitized = sanitizeStateForPlayer(session.state, playerId);
-      client.send(
-        JSON.stringify({
-          type: "STATE_UPDATE",
-          state: { ...sanitized, hostPlayerId: session.hostPlayerId },
-          yourPlayerId: playerId,
-          gameType: session.gameType,
-        }),
-      );
+      sendStateToClient(sessionId, client, playerId || null);
     }
   }
+}
+
+function createStateUpdateEvent(
+  sessionId: string,
+  playerId: string | null,
+): ServerEvent | null {
+  const session = sessions[sessionId];
+  if (!session) {
+    return null;
+  }
+  const sanitized = sanitizeStateForPlayer(session.state, playerId ?? "");
+  const role: SessionRole = playerId
+    ? session.hostPlayerId === playerId
+      ? "HOST"
+      : "PLAYER"
+    : "SPECTATOR";
+
+  let reconnectToken: string | undefined;
+  if (playerId) {
+    const reconnectVersion = session.validReconnectVersions[playerId] ?? 1;
+    session.validReconnectVersions[playerId] = reconnectVersion;
+    reconnectToken = issueReconnectToken(
+      sessionId,
+      playerId,
+      role,
+      reconnectVersion,
+    );
+  }
+
+  return {
+    type: "STATE_UPDATE",
+    state: { ...sanitized, hostPlayerId: session.hostPlayerId },
+    yourPlayerId: playerId,
+    gameType: session.gameType,
+    stateVersion: session.stateVersion,
+    lifecycleState: session.lifecycleState,
+    reconnectToken,
+    inviteToken: role === "HOST" ? session.inviteToken : undefined,
+    capabilities: {
+      canPlay: role === "HOST" || role === "PLAYER",
+      canHostActions: role === "HOST",
+    },
+  };
+}
+
+function sendStateToClient(
+  sessionId: string,
+  ws: WebSocket,
+  playerId: string | null,
+) {
+  const event = createStateUpdateEvent(sessionId, playerId);
+  if (!event) {
+    return;
+  }
+  sendServerEvent(ws, event);
 }
 
 /** Mark a player as connected/disconnected in game state */
@@ -262,13 +499,22 @@ function setPlayerConnected(
   session: Session,
   playerId: string,
   connected: boolean,
-) {
+): boolean {
+  let changed = false;
   session.state = {
     ...session.state,
     players: session.state.players.map((p: any) =>
-      p.id === playerId ? { ...p, isConnected: connected } : p,
+      p.id === playerId
+        ? (() => {
+            if (p.isConnected !== connected) {
+              changed = true;
+            }
+            return { ...p, isConnected: connected };
+          })()
+        : p,
     ),
   };
+  return changed;
 }
 
 /** Check if any WS in the session is bound to this playerId and is still OPEN */
@@ -541,8 +787,9 @@ function createEmptyState(
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (wsAliveMap.get(ws) === false) {
-      // Missed the last pong — terminate
-      console.log("Terminating unresponsive WebSocket");
+      logEvent("warn", "ws.heartbeat_terminated", {
+        errorClass: "HEARTBEAT_TIMEOUT",
+      });
       ws.terminate();
       return;
     }
@@ -553,161 +800,470 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on("close", () => clearInterval(heartbeatInterval));
 
-// ─── Inactivity Timeout System ───────────────────────────
-const inactivityInterval = setInterval(() => {
-  const now = Date.now();
-  for (const [sid, session] of Object.entries(sessions)) {
-    if (session.state.phase !== "PLAYING") continue;
-    if (!("activePlayerIndex" in session.state)) continue;
-    if (session.clients.size === 0) continue;
-
-    const activeIdx = (session.state as any).activePlayerIndex;
-    if (activeIdx == null || !session.state.players[activeIdx]) continue;
-
-    const lastAction = session.lastActionTimestamp || now;
-    if (now - lastAction > INACTIVITY_TIMEOUT_MS) {
-      session.state = prependServerMove(
-        {
-          ...session.state,
-          activePlayerIndex: (activeIdx + 1) % session.state.players.length,
-        },
-        createServerMove("Turn auto-skipped due to inactivity."),
-      );
-      session.lastActionTimestamp = now;
-      broadcastState(sid);
+function finalizePlayerDisconnect(sessionId: string, playerId: string) {
+  const session = sessions[sessionId];
+  if (!session) {
+    return;
+  }
+  let hasOpenSocket = false;
+  for (const [ws, pid] of session.clients.entries()) {
+    if (pid === playerId && ws.readyState === WebSocket.OPEN) {
+      hasOpenSocket = true;
+      break;
     }
   }
-}, INACTIVITY_CHECK_INTERVAL_MS);
+  if (hasOpenSocket) {
+    return;
+  }
 
-export { sanitizeStateForPlayer }; // Export for testing
+  const changed = setPlayerConnected(session, playerId, false);
+  if (changed) {
+    session.stateVersion += 1;
+  }
+  ensureValidHost(session, playerId);
+  ensureLifecycleForCurrentState(sessionId, session, "player-disconnect-finalized");
+  session.lastActionTimestamp = Date.now();
+  broadcastState(sessionId);
+}
+
+const sessionOrchestrator = new SessionOrchestrator<Session>({
+  tickIntervalMs: ORCHESTRATOR_TICK_INTERVAL_MS,
+  inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
+  cleanupDelayMs: SESSION_CLEANUP_DELAY_MS,
+  disconnectGraceMs: DISCONNECT_GRACE_MS,
+  getSessions: () => sessions,
+  onInactivityTimeout: (sessionId) => {
+    const session = sessions[sessionId];
+    if (!session || session.state.players.length === 0) {
+      return;
+    }
+    const activeIdx = session.state.activePlayerIndex;
+    if (activeIdx == null || !session.state.players[activeIdx]) {
+      return;
+    }
+    session.state = prependServerMove(
+      {
+        ...session.state,
+        activePlayerIndex: (activeIdx + 1) % session.state.players.length,
+      },
+      createServerMove("Turn auto-skipped due to inactivity."),
+    );
+    session.stateVersion += 1;
+    ensureLifecycleForCurrentState(sessionId, session, "inactivity-autoskip");
+    session.lastActionTimestamp = Date.now();
+    logEvent("info", "session.inactivity_autoskip", {
+      sessionId,
+      lifecycleState: session.lifecycleState,
+    });
+    broadcastState(sessionId);
+  },
+  onCleanupDue: (sessionId) => {
+    const session = sessions[sessionId];
+    if (!session || session.clients.size > 0) {
+      return;
+    }
+    logEvent("info", "session.cleanup_unloaded", {
+      sessionId,
+      lifecycleState: session.lifecycleState,
+      lifecycleReason: session.lifecycleReason,
+    });
+    persistSessionState(sessionId, "idle-unload");
+    delete sessions[sessionId];
+    sessionOrchestrator.clearSession(sessionId);
+  },
+  onDisconnectDue: finalizePlayerDisconnect,
+});
+
+export { sanitizeStateForPlayer };
 
 wss.on("connection", (ws) => {
-  console.log("Client connected");
+  logEvent("info", "ws.connected");
   wsAliveMap.set(ws, true);
   let currentSessionId: string | null = null;
   let myPlayerId: string | null = null;
+  let myRole: SessionRole = "SPECTATOR";
+  let myConnectionEpoch = 0;
+  const rateLimiter = new TokenBucket({
+    capacity: RATE_LIMIT_BUCKET_CAPACITY,
+    refillTokensPerSecond: RATE_LIMIT_REFILL_PER_SECOND,
+  });
 
-  let messageCount = 0;
-  let windowStart = Date.now();
+  const bindSocketToPlayer = (
+    sessionId: string,
+    session: Session,
+    playerId: string,
+  ) => {
+    for (const [oldWs, oldPid] of session.clients.entries()) {
+      if (oldPid === playerId && oldWs !== ws) {
+        session.clients.delete(oldWs);
+        try {
+          oldWs.close(4001, "Replaced by new connection");
+        } catch (closeError) {
+          logEvent("warn", "ws.replaced_socket_close_failed", {
+            sessionId,
+            playerId,
+            errorClass: "SOCKET_CLOSE",
+            detail:
+              closeError instanceof Error
+                ? closeError.message
+                : "unknown close error",
+          });
+        }
+      }
+    }
+
+    session.clients.set(ws, playerId);
+    sessionOrchestrator.cancelCleanup(sessionId);
+    sessionOrchestrator.cancelDisconnect(sessionId, playerId);
+    myPlayerId = playerId;
+    myRole = session.hostPlayerId === playerId ? "HOST" : "PLAYER";
+
+    const connectedChanged = setPlayerConnected(session, playerId, true);
+    if (connectedChanged) {
+      session.stateVersion += 1;
+    }
+
+    const nextEpoch = (session.connectionEpochByPlayer[playerId] ?? 0) + 1;
+    session.connectionEpochByPlayer[playerId] = nextEpoch;
+    myConnectionEpoch = nextEpoch;
+  };
+
+  const bindSocketAsUnclaimed = (
+    sessionId: string,
+    session: Session,
+    role: SessionRole = "PLAYER",
+  ) => {
+    session.clients.set(ws, "");
+    sessionOrchestrator.cancelCleanup(sessionId);
+    myPlayerId = null;
+    myRole = role;
+    myConnectionEpoch = 0;
+  };
+
+  const sendCurrentStateToSocket = () => {
+    if (!currentSessionId) {
+      return;
+    }
+    const liveSession = sessions[currentSessionId];
+    if (!liveSession) {
+      return;
+    }
+    const playerId = liveSession.clients.get(ws) || null;
+    sendStateToClient(currentSessionId, ws, playerId);
+  };
 
   ws.on("pong", () => {
     wsAliveMap.set(ws, true);
   });
 
   ws.on("message", (raw) => {
+    const receivedAt = Date.now();
+    const startedAt = performance.now();
     const rawMessage = raw.toString();
+    const payloadBytes = Buffer.byteLength(rawMessage, "utf8");
     if (Buffer.byteLength(rawMessage, "utf8") > MAX_WS_MESSAGE_BYTES) {
-      sendError(ws, "Payload too large.");
+      sendError(ws, "Payload too large.", {
+        sessionId: currentSessionId ?? undefined,
+        playerId: myPlayerId,
+      });
       ws.close(1009, "Payload too large");
       return;
     }
 
-    const now = Date.now();
-    if (now - windowStart >= RATE_LIMIT_WINDOW_MS) {
-      messageCount = 1;
-      windowStart = now;
-    } else {
-      messageCount++;
-      if (messageCount > MAX_MESSAGES_PER_WINDOW) {
-        sendError(ws, "Rate limit exceeded.");
-        return;
-      }
+    if (!rateLimiter.consume(1, receivedAt)) {
+      sendError(ws, "Rate limit exceeded.", {
+        sessionId: currentSessionId ?? undefined,
+        playerId: myPlayerId,
+      });
+      return;
     }
 
     try {
       const parsed: unknown = JSON.parse(rawMessage);
-      if (!isRecord(parsed) || typeof parsed.type !== "string") {
-        sendError(ws, "Invalid message envelope.");
+      const parsedMessage = parseClientMessage(parsed);
+      if (!parsedMessage.ok) {
+        sendError(ws, parsedMessage.error, {
+          sessionId: currentSessionId ?? undefined,
+          playerId: myPlayerId,
+        });
         return;
       }
 
-      if (!isSupportedMessageType(parsed.type)) {
-        sendError(ws, `Unsupported message type: ${parsed.type}`);
-        return;
-      }
-
-      const data = parsed as ClientMessage;
-      console.log("Received:", data.type);
+      const data = parsedMessage.data;
+      const latencyMs = Math.round((performance.now() - startedAt) * 100) / 100;
+      logEvent("debug", "ws.message_received", {
+        sessionId: currentSessionId ?? undefined,
+        playerId: myPlayerId ?? undefined,
+        messageType: data.type,
+        payloadBytes,
+        latencyMs,
+      });
 
       const session = currentSessionId ? sessions[currentSessionId] : null;
+      if (
+        session &&
+        isMutatingMessageType(data.type) &&
+        "messageId" in data &&
+        data.messageId &&
+        hasProcessedMessage(session, data.messageId)
+      ) {
+        sendCurrentStateToSocket();
+        return;
+      }
+
+      if (
+        session &&
+        isMutatingMessageType(data.type) &&
+        "expectedStateVersion" in data &&
+        data.expectedStateVersion !== undefined &&
+        data.expectedStateVersion !== session.stateVersion
+      ) {
+        sendError(
+          ws,
+          `Stale state version. Expected ${session.stateVersion}, received ${data.expectedStateVersion}.`,
+          {
+            sessionId: currentSessionId ?? undefined,
+            playerId: myPlayerId,
+            messageType: data.type,
+          },
+        );
+        sendCurrentStateToSocket();
+        return;
+      }
+
+      if (
+        session &&
+        isMutatingMessageType(data.type) &&
+        "messageId" in data &&
+        data.messageId
+      ) {
+        markProcessedMessage(session, data.messageId);
+      }
 
       switch (data.type) {
         case "CREATE_SESSION": {
-          if (!isValidGameType(data.gameType)) {
-            sendError(ws, "Invalid game type.");
-            break;
-          }
-
           const gameType = data.gameType;
           const sessionId = generateSessionId();
+          const joinNonce = crypto.randomBytes(12).toString("hex");
+          const inviteToken = issueInviteToken(sessionId);
           sessions[sessionId] = {
             clients: new Map([[ws, ""]]),
             state: createEmptyState(sessionId, gameType),
             gameType,
             hostPlayerId: null,
-            cleanupTimer: null,
             lastActionTimestamp: Date.now(),
+            stateVersion: 0,
+            lifecycleState: "LOBBY",
+            lifecycleUpdatedAt: Date.now(),
+            lifecycleReason: "session-created",
+            inviteToken,
+            processedMessageIds: new Map(),
+            pendingJoinNonces: new Map([
+              [joinNonce, Date.now() + PENDING_JOIN_NONCE_TTL_MS],
+            ]),
+            validReconnectVersions: {},
+            connectionEpochByPlayer: {},
           };
+          const createdSession = sessions[sessionId];
           currentSessionId = sessionId;
-          ws.send(
-            JSON.stringify({ type: "SESSION_CREATED", sessionId, gameType }),
+          myRole = "PLAYER";
+          myPlayerId = null;
+
+          const sessionToken = issueSessionToken(sessionId, joinNonce, "PLAYER");
+          sendServerEvent(ws, {
+            type: "SESSION_CREATED",
+            sessionId,
+            gameType,
+            inviteToken,
+            sessionToken,
+          });
+          transitionSessionLifecycle(
+            sessionId,
+            createdSession,
+            "LOBBY",
+            "session-created",
           );
           broadcastState(sessionId);
           break;
         }
 
         case "JOIN_SESSION": {
-          if (typeof data.sessionId !== "string") {
-            sendError(ws, "Missing or invalid sessionId.");
-            break;
-          }
-
-          const sid = data.sessionId.trim().toUpperCase();
-          if (!/^[A-F0-9]{4}$/.test(sid)) {
-            sendError(ws, "Invalid session code.");
-            break;
-          }
+          const sid = data.sessionId.toUpperCase();
 
           if (!sessions[sid]) {
-            const persisted = db.loadSession(sid);
+            const persisted = db.recoverSession(sid);
             if (persisted) {
-              const state = persisted.state;
-              if (state.players) {
-                state.players.forEach((p: any) => (p.isConnected = false));
-              }
-              sessions[sid] = {
-                clients: new Map(),
-                state: state,
-                gameType: persisted.gameType as GameType,
-                hostPlayerId: persisted.hostPlayerId,
-                cleanupTimer: null,
-                lastActionTimestamp: Date.now(),
-              };
+              sessions[sid] = hydrateSessionFromEnvelope(persisted);
+              sessions[sid].lifecycleReason = "session-restored-on-demand";
               ensureValidHost(sessions[sid]);
             } else {
-              sendError(ws, "Session not found.");
+              sendError(ws, "Session not found.", {
+                sessionId: sid,
+                playerId: myPlayerId,
+                messageType: data.type,
+              });
               break;
             }
           }
 
-          // Cancel any pending cleanup if someone is reconnecting
           const targetSession = sessions[sid];
-          if (targetSession.cleanupTimer) {
-            clearTimeout(targetSession.cleanupTimer);
-            targetSession.cleanupTimer = null;
-          }
+          sessionOrchestrator.cancelCleanup(sid);
 
-          targetSession.clients.set(ws, "");
-          ensureValidHost(targetSession);
+          pruneSessionCaches(targetSession);
           currentSessionId = sid;
-          ws.send(
-            JSON.stringify({
+
+          if (data.reconnectToken) {
+            const reconnectTraceId = crypto.randomBytes(6).toString("hex");
+            const verified = verifyToken(data.reconnectToken, "reconnect");
+            if (!verified.ok) {
+              sendError(ws, verified.error, {
+                sessionId: sid,
+                playerId: myPlayerId,
+                messageType: data.type,
+                reconnectTraceId,
+              });
+              break;
+            }
+            if (verified.claims.sid !== sid) {
+              sendError(ws, "Reconnect token does not match this session.", {
+                sessionId: sid,
+                playerId: verified.claims.pid,
+                messageType: data.type,
+                reconnectTraceId,
+              });
+              break;
+            }
+
+            const reconnectingPlayer = targetSession.state.players.find(
+              (p: any) => p.id === verified.claims.pid,
+            );
+            if (!reconnectingPlayer) {
+              sendError(ws, "Reconnect token refers to a missing player.", {
+                sessionId: sid,
+                playerId: verified.claims.pid,
+                messageType: data.type,
+                reconnectTraceId,
+              });
+              break;
+            }
+
+            const knownVersion =
+              targetSession.validReconnectVersions[verified.claims.pid];
+            if (
+              knownVersion !== undefined &&
+              knownVersion !== verified.claims.reconnectVersion
+            ) {
+              sendError(ws, "Stale reconnect token.", {
+                sessionId: sid,
+                playerId: verified.claims.pid,
+                messageType: data.type,
+                reconnectTraceId,
+              });
+              break;
+            }
+
+            targetSession.validReconnectVersions[verified.claims.pid] =
+              verified.claims.reconnectVersion + 1;
+
+            bindSocketToPlayer(sid, targetSession, verified.claims.pid);
+            ensureValidHost(targetSession);
+            ensureLifecycleForCurrentState(
+              sid,
+              targetSession,
+              "player-reconnected",
+            );
+            logEvent("info", "session.reconnect_resumed", {
+              sessionId: sid,
+              playerId: verified.claims.pid,
+              reconnectTraceId,
+              lifecycleState: targetSession.lifecycleState,
+            });
+
+            const reconnectToken = issueReconnectToken(
+              sid,
+              verified.claims.pid,
+              myRole,
+              targetSession.validReconnectVersions[verified.claims.pid],
+            );
+
+            sendServerEvent(ws, {
               type: "SESSION_JOINED",
               sessionId: sid,
               gameType: targetSession.gameType,
-            }),
+              stateVersion: targetSession.stateVersion,
+              lifecycleState: targetSession.lifecycleState,
+              resumed: true,
+              role: myRole,
+              reconnectToken,
+            });
+            broadcastState(sid);
+            break;
+          }
+
+          if (!data.inviteToken) {
+            sendError(ws, "inviteToken is required for new session joins.", {
+              sessionId: sid,
+              playerId: myPlayerId,
+              messageType: data.type,
+            });
+            break;
+          }
+          const inviteCheck = verifyToken(data.inviteToken, "invite");
+          if (!inviteCheck.ok) {
+            sendError(ws, inviteCheck.error, {
+              sessionId: sid,
+              playerId: myPlayerId,
+              messageType: data.type,
+            });
+            break;
+          }
+          if (inviteCheck.claims.sid !== sid) {
+            sendError(ws, "Invite token does not match this session.", {
+              sessionId: sid,
+              playerId: myPlayerId,
+              messageType: data.type,
+            });
+            break;
+          }
+
+          const requestedRole = data.joinAs === "SPECTATOR" ? "SPECTATOR" : "PLAYER";
+          if (requestedRole === "PLAYER" && targetSession.state.phase !== "LOBBY") {
+            sendError(
+              ws,
+              "Game already in progress. Use a reconnect token to reclaim your seat.",
+            );
+            break;
+          }
+
+          bindSocketAsUnclaimed(sid, targetSession, requestedRole);
+          ensureValidHost(targetSession);
+          ensureLifecycleForCurrentState(
+            sid,
+            targetSession,
+            "session-join-authorized",
           );
-          broadcastState(sid);
+
+          let sessionToken: string | undefined;
+          if (requestedRole === "PLAYER") {
+            const joinNonce = crypto.randomBytes(12).toString("hex");
+            targetSession.pendingJoinNonces.set(
+              joinNonce,
+              Date.now() + PENDING_JOIN_NONCE_TTL_MS,
+            );
+            sessionToken = issueSessionToken(sid, joinNonce, "PLAYER");
+          }
+
+          sendServerEvent(ws, {
+            type: "SESSION_JOINED",
+            sessionId: sid,
+            gameType: targetSession.gameType,
+            stateVersion: targetSession.stateVersion,
+            lifecycleState: targetSession.lifecycleState,
+            resumed: false,
+            role: requestedRole,
+            sessionToken,
+          });
+          sendCurrentStateToSocket();
           break;
         }
 
@@ -716,117 +1272,91 @@ wss.on("connection", (ws) => {
             sendError(ws, "Join a session first.");
             break;
           }
-          if (!isRecord(data.player)) {
-            sendError(ws, "Invalid player payload.");
+          if (myPlayerId) {
+            sendError(ws, "Already joined as a player.");
             break;
           }
 
-          const player = data.player;
-          if (typeof player.id !== "string" || typeof player.name !== "string") {
-            sendError(ws, "Player id and name are required.");
+          const tokenCheck = verifyToken(data.sessionToken, "session");
+          if (!tokenCheck.ok) {
+            sendError(ws, tokenCheck.error);
             break;
           }
-          if (player.id.length < 1 || player.id.length > 64) {
-            sendError(ws, "Invalid player id.");
+          if (tokenCheck.claims.sid !== currentSessionId) {
+            sendError(ws, "Session token does not match this session.");
             break;
           }
-
-          // ── Validate player name ──
-          const trimmedName = (player.name || "").trim();
-          if (
-            !trimmedName ||
-            trimmedName.length < 1 ||
-            trimmedName.length > 20
-          ) {
-            sendError(ws, "Name must be 1–20 characters.");
+          if (tokenCheck.claims.role !== "PLAYER") {
+            sendError(ws, "Spectators cannot join the lobby as players.");
             break;
           }
-
-          const existingPlayer = session.state.players.find(
-            (p: any) => p.id === player.id,
+          const nonceExpiry = session.pendingJoinNonces.get(
+            tokenCheck.claims.joinNonce,
           );
-
-          if (existingPlayer) {
-            // ── Reconnecting player ──
-            // Close any old sockets bound to this player
-            for (const [oldWs, oldPid] of session.clients.entries()) {
-              if (oldPid === player.id && oldWs !== ws) {
-                session.clients.delete(oldWs);
-                try {
-                  oldWs.close(4001, "Replaced by new connection");
-                } catch (closeError) {
-                  console.error("Failed to close replaced socket:", closeError);
-                }
-              }
-            }
-            session.clients.set(ws, player.id);
-            myPlayerId = player.id;
-            setPlayerConnected(session, player.id, true);
-            ensureValidHost(session);
-            console.log(
-              `Player ${existingPlayer.name} (${player.id}) reconnected to session ${currentSessionId}`,
-            );
-          } else {
-            // ── New player joining ──
-            if (session.state.phase !== "LOBBY") {
-              sendError(ws, "Game already in progress.");
-              break;
-            }
-
-            // Enforce max players
-            const maxPlayers = MAX_PLAYERS[session.gameType] || 10;
-            if (session.state.players.length >= maxPlayers) {
-              sendError(ws, `Lobby is full (${maxPlayers} players max).`);
-              break;
-            }
-
-            // Reject duplicate names (case-insensitive)
-            const nameLower = trimmedName.toLowerCase();
-            if (
-              session.state.players.some(
-                (p: any) => p.name.toLowerCase() === nameLower,
-              )
-            ) {
-              sendError(ws, "That name is already taken.");
-              break;
-            }
-
-            // Check if someone with this exact player.id already exists (shouldn't happen, but guard)
-            if (session.state.players.some((p: any) => p.id === player.id)) {
-              sendError(
-                ws,
-                "Player ID collision. Please refresh and try again.",
-              );
-              break;
-            }
-
-            const seatIndex =
-              typeof player.seatIndex === "number"
-                ? player.seatIndex
-                : session.state.players.length;
-            const team = player.team === "TEAM_B" ? "TEAM_B" : "TEAM_A";
-            session.state = {
-              ...session.state,
-              players: [
-                ...session.state.players,
-                {
-                  id: player.id,
-                  name: trimmedName,
-                  team,
-                  seatIndex,
-                  isConnected: true,
-                },
-              ],
-            };
-            session.clients.set(ws, player.id);
-            myPlayerId = player.id;
-
-            // First player to join becomes host
-            if (!session.hostPlayerId) {
-              session.hostPlayerId = player.id;
-            }
+          if (!nonceExpiry || nonceExpiry <= Date.now()) {
+            sendError(ws, "Session token has already been used or expired.");
+            break;
           }
-          broadcastState(currentSessionId!);
+          session.pendingJoinNonces.delete(tokenCheck.claims.joinNonce);
+
+          if (session.state.phase !== "LOBBY") {
+            sendError(ws, "Game already in progress.");
+            break;
+          }
+
+          const maxPlayers = MAX_PLAYERS[session.gameType] || 10;
+          if (session.state.players.length >= maxPlayers) {
+            sendError(ws, `Lobby is full (${maxPlayers} players max).`);
+            break;
+          }
+
+          const trimmedName = data.player.name.trim();
+          const nameLower = trimmedName.toLowerCase();
+          if (
+            session.state.players.some((p: any) => p.name.toLowerCase() === nameLower)
+          ) {
+            sendError(ws, "That name is already taken.");
+            break;
+          }
+
+          let playerId = generatePlayerId();
+          while (session.state.players.some((p: any) => p.id === playerId)) {
+            playerId = generatePlayerId();
+          }
+
+          const seatIndex =
+            typeof data.player.seatIndex === "number"
+              ? data.player.seatIndex
+              : session.state.players.length;
+          const team = data.player.team === "TEAM_B" ? "TEAM_B" : "TEAM_A";
+
+          session.state = {
+            ...session.state,
+            players: [
+              ...session.state.players,
+              {
+                id: playerId,
+                name: trimmedName,
+                team,
+                seatIndex,
+                isConnected: true,
+              },
+            ],
+          };
+
+          if (!session.hostPlayerId) {
+            session.hostPlayerId = playerId;
+          }
+          session.stateVersion += 1;
+          session.validReconnectVersions[playerId] = 1;
+          bindSocketToPlayer(currentSessionId, session, playerId);
+          ensureValidHost(session);
+          ensureLifecycleForCurrentState(
+            currentSessionId,
+            session,
+            "player-joined-lobby",
+          );
+          broadcastState(currentSessionId);
           break;
         }
 
@@ -845,28 +1375,14 @@ wss.on("connection", (ws) => {
             sendError(ws, "Join a session first.");
             break;
           }
-          if (!myPlayerId) {
+          if (!myPlayerId || (myRole !== "HOST" && myRole !== "PLAYER")) {
             sendError(ws, "Join the lobby before sending actions.");
             break;
           }
-
-          if (data.targetId !== undefined && typeof data.targetId !== "string") {
-            sendError(ws, "Invalid targetId.");
-            break;
-          }
-          if (data.actionType !== undefined && typeof data.actionType !== "string") {
-            sendError(ws, "Invalid actionType.");
-            break;
-          }
-          if (data.roleClaimed !== undefined && typeof data.roleClaimed !== "string") {
-            sendError(ws, "Invalid roleClaimed.");
-            break;
-          }
-          if (
-            data.influenceIndex !== undefined &&
-            typeof data.influenceIndex !== "number"
-          ) {
-            sendError(ws, "Invalid influenceIndex.");
+          const latestEpoch = session.connectionEpochByPlayer[myPlayerId] ?? 0;
+          if (myConnectionEpoch !== latestEpoch) {
+            sendError(ws, "Stale connection. Reconnect and try again.");
+            sendCurrentStateToSocket();
             break;
           }
 
@@ -919,13 +1435,19 @@ wss.on("connection", (ws) => {
             } else if (result.state) {
               liveSession.state = capMoveLog(result.state);
               liveSession.lastActionTimestamp = Date.now();
+              liveSession.stateVersion += 1;
               ensureValidHost(liveSession);
+              ensureLifecycleForCurrentState(
+                currentSessionId!,
+                liveSession,
+                "game-action",
+              );
               broadcastState(currentSessionId!);
             }
           };
 
           if (data.type === "START_GAME") {
-            if (session.hostPlayerId && myPlayerId !== session.hostPlayerId) {
+            if (myRole !== "HOST" || myPlayerId !== session.hostPlayerId) {
               sendError(ws, "Only the host can start the game.");
               break;
             }
@@ -940,30 +1462,28 @@ wss.on("connection", (ws) => {
             sendError(ws, "Join a session first.");
             break;
           }
-          if (myPlayerId !== session.hostPlayerId) {
+          if (myRole !== "HOST" || myPlayerId !== session.hostPlayerId) {
             sendError(ws, "Only the host can perform administrative actions.");
-            break;
-          }
-          if (typeof data.action !== "string") {
-            sendError(ws, "Invalid host action.");
             break;
           }
 
           const action = data.action;
           if (action === "END_GAME") {
-            db.deleteSession(currentSessionId);
+            transitionSessionLifecycle(
+              currentSessionId,
+              session,
+              "ENDED",
+              "host-ended-game",
+            );
+            db.markSessionDeleted(currentSessionId, "host-ended-game");
             for (const clientWs of session.clients.keys()) {
-              clientWs.send(
-                JSON.stringify({
-                  type: "ERROR",
-                  message: "The host has ended the game.",
-                }),
-              );
+              sendError(clientWs, "The host has ended the game.");
               clientWs.close(1000, "Game ended by host");
             }
             delete sessions[currentSessionId];
+            sessionOrchestrator.clearSession(currentSessionId);
           } else if (action === "KICK_PLAYER") {
-            if (typeof data.targetId !== "string") {
+            if (!data.targetId) {
               sendError(ws, "Invalid targetId.");
               break;
             }
@@ -1002,21 +1522,24 @@ wss.on("connection", (ws) => {
             // Disconnect the kicked player
             for (const [clientWs, pid] of session.clients.entries()) {
               if (pid === targetId) {
-                clientWs.send(
-                  JSON.stringify({
-                    type: "ERROR",
-                    message: "You have been kicked by the host.",
-                  }),
-                );
+                sendError(clientWs, "You have been kicked by the host.");
                 clientWs.close(1000, "Kicked by host");
                 session.clients.delete(clientWs);
               }
             }
 
+            delete session.validReconnectVersions[targetId];
+            delete session.connectionEpochByPlayer[targetId];
             ensureValidHost(session, targetId);
             session.state = prependServerMove(
               session.state,
               createServerMove("Host removed a player from the session.", "Host"),
+            );
+            session.stateVersion += 1;
+            ensureLifecycleForCurrentState(
+              currentSessionId,
+              session,
+              "host-kick-player",
             );
             session.lastActionTimestamp = Date.now();
             broadcastState(currentSessionId);
@@ -1034,6 +1557,12 @@ wss.on("connection", (ws) => {
                 },
                 createServerMove("Host forced a turn skip.", "Host"),
               );
+              session.stateVersion += 1;
+              ensureLifecycleForCurrentState(
+                currentSessionId,
+                session,
+                "host-force-skip",
+              );
               session.lastActionTimestamp = Date.now();
               broadcastState(currentSessionId);
             }
@@ -1048,8 +1577,16 @@ wss.on("connection", (ws) => {
           break;
         }
       }
-    } catch (e) {
-      console.error("Message error:", e);
+    } catch (error) {
+      const isSyntaxError = error instanceof SyntaxError;
+      sendError(
+        ws,
+        isSyntaxError ? "Invalid JSON payload." : "Message processing failed.",
+        {
+          sessionId: currentSessionId ?? undefined,
+          playerId: myPlayerId,
+        },
+      );
     }
   });
 
@@ -1064,9 +1601,15 @@ wss.on("connection", (ws) => {
         disconnectedPlayerId &&
         !isPlayerConnectedViaAnotherSocket(session, disconnectedPlayerId, ws)
       ) {
-        setPlayerConnected(session, disconnectedPlayerId, false);
-        ensureValidHost(session, disconnectedPlayerId);
-        broadcastState(currentSessionId);
+        sessionOrchestrator.scheduleDisconnect(
+          currentSessionId,
+          disconnectedPlayerId,
+        );
+        logEvent("info", "session.disconnect_scheduled", {
+          sessionId: currentSessionId,
+          playerId: disconnectedPlayerId,
+          lifecycleState: session.lifecycleState,
+        });
       }
 
       // Prune any other dead clients
@@ -1074,23 +1617,33 @@ wss.on("connection", (ws) => {
 
       // Schedule cleanup if no one is left
       if (session.clients.size === 0) {
-        const sid = currentSessionId;
-        session.cleanupTimer = setTimeout(() => {
-          if (sessions[sid] && sessions[sid].clients.size === 0) {
-            console.log(
-              `Unloading idle session ${sid} from memory (persisted to DB)`,
-            );
-            delete sessions[sid];
-          }
-        }, SESSION_CLEANUP_DELAY_MS);
+        transitionSessionLifecycle(
+          currentSessionId,
+          session,
+          "IDLE_EMPTY",
+          "no-active-clients",
+        );
+        sessionOrchestrator.scheduleCleanup(currentSessionId);
+        persistSessionState(currentSessionId, "session-idle");
+      } else {
+        sessionOrchestrator.cancelCleanup(currentSessionId);
+        ensureLifecycleForCurrentState(
+          currentSessionId,
+          session,
+          "clients-still-connected",
+        );
       }
     }
+    logEvent("info", "ws.closed", {
+      sessionId: currentSessionId ?? undefined,
+      playerId: myPlayerId ?? undefined,
+    });
   });
 });
 
 function persistAllSessions() {
-  for (const [sessionId, session] of Object.entries(sessions)) {
-    db.saveSession(sessionId, session.gameType, session.state, session.hostPlayerId);
+  for (const sessionId of Object.keys(sessions)) {
+    persistSessionState(sessionId, "process-shutdown");
   }
 }
 
@@ -1100,16 +1653,10 @@ function shutdownGracefully(signal: string) {
     return;
   }
   isShuttingDown = true;
-  console.log(`Received ${signal}. Persisting active sessions before shutdown...`);
+  logEvent("info", "process.shutdown_requested", { detail: signal });
 
   clearInterval(heartbeatInterval);
-  clearInterval(inactivityInterval);
-  for (const session of Object.values(sessions)) {
-    if (session.cleanupTimer) {
-      clearTimeout(session.cleanupTimer);
-      session.cleanupTimer = null;
-    }
-  }
+  sessionOrchestrator.stop();
 
   persistAllSessions();
   server.close(() => {
@@ -1117,7 +1664,7 @@ function shutdownGracefully(signal: string) {
   });
 
   setTimeout(() => {
-    console.error("Forced shutdown after timeout.");
+    logEvent("error", "process.shutdown_forced");
     process.exit(1);
   }, 5_000).unref();
 }
@@ -1133,6 +1680,59 @@ app.get("/*splat", (_req, res) => {
   res.sendFile(path.join(__dirname, "../dist/index.html"));
 });
 
-server.listen(PORT, () => {
-  console.log(`Cardio server listening on port ${PORT}`);
-});
+let isServerListening = false;
+
+function getBoundPort(): number | null {
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    return null;
+  }
+  return address.port;
+}
+
+export function startServer(port: number = Number(PORT)): Promise<number> {
+  if (isServerListening) {
+    return Promise.resolve(getBoundPort() ?? port);
+  }
+  sessionOrchestrator.start();
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, () => {
+      server.off("error", reject);
+      isServerListening = true;
+      const actualPort = getBoundPort() ?? port;
+      logEvent("info", "server.started", { detail: String(actualPort) });
+      resolve(actualPort);
+    });
+  });
+}
+
+export function stopServer(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!isServerListening) {
+      sessionOrchestrator.stop();
+      resolve();
+      return;
+    }
+    persistAllSessions();
+    sessionOrchestrator.stop();
+    server.close(() => {
+      isServerListening = false;
+      logEvent("info", "server.stopped");
+      resolve();
+    });
+  });
+}
+
+export function simulateCrashRecoveryForTests() {
+  persistAllSessions();
+  for (const sessionId of Object.keys(sessions)) {
+    sessionOrchestrator.clearSession(sessionId);
+    delete sessions[sessionId];
+  }
+  restoreSessionsFromPersistence("test-simulated-recovery");
+}
+
+if (process.env.NODE_ENV !== "test") {
+  void startServer();
+}

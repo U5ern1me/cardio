@@ -2,32 +2,24 @@ import { useState } from "react";
 import { useGame } from "../context/GameContext";
 
 export default function Lobby() {
-  const { gameState, sendMessage, myPlayerId, clearSession } = useGame();
+  const { gameState, sendMessage, myPlayerId, clearSession, inviteToken } = useGame();
   const [playerName, setPlayerName] = useState("");
   const [selectedTeam, setSelectedTeam] = useState<"TEAM_A" | "TEAM_B" | null>(
     null,
   );
-
-  // Reuse persisted player ID if available, otherwise generate a new one
-  const [localId] = useState(() => {
-    const persisted = localStorage.getItem("cardio_playerId");
-    if (persisted) return persisted;
-    return crypto.randomUUID().slice(0, 8);
-  });
 
   if (!gameState) return null;
 
   const isLiterature = gameState.gameType === "LITERATURE";
   const isSpades = gameState.gameType === "SPADES";
   const isJoined =
-    !!gameState.players.find((p) => p.id === localId) ||
-    !!gameState.players.find((p) => p.id === myPlayerId);
+    !!myPlayerId && !!gameState.players.find((p) => p.id === myPlayerId);
 
   // Determine host using server authority, with legacy fallback.
   const hostId =
     gameState.hostPlayerId ??
     (gameState.players.length > 0 ? gameState.players[0].id : null);
-  const isHost = myPlayerId === hostId || localId === hostId;
+  const isHost = myPlayerId === hostId;
 
   const MAX_PLAYERS: Record<string, number> = {
     LITERATURE: 8,
@@ -54,11 +46,9 @@ export default function Lobby() {
     sendMessage({
       type: "JOIN_LOBBY",
       player: {
-        id: localId,
         name: playerName.trim(),
         team: selectedTeam || "TEAM_A",
         seatIndex: gameState.players.length,
-        isConnected: true,
       },
     });
   };
@@ -82,6 +72,16 @@ export default function Lobby() {
               {gameState.sessionId}
             </span>
           </div>
+          {isHost && inviteToken && (
+            <div className="mt-3 max-w-xl">
+              <p className="text-[10px] md:text-xs text-outline uppercase tracking-widest font-label-md mb-1">
+                Invite Token
+              </p>
+              <div className="text-[11px] md:text-xs font-mono break-all bg-surface-container-low border border-outline-variant rounded-xl p-3">
+                {inviteToken}
+              </div>
+            </div>
+          )}
         </div>
         <div className="w-full sm:w-auto text-left sm:text-right flex flex-row-reverse sm:flex-col items-center sm:items-end justify-between sm:justify-end gap-2">
           <button
@@ -122,13 +122,13 @@ export default function Lobby() {
               </div>
               <div className="space-y-3">
                 {teamA.map((p) => (
-                  <PlayerCard
-                    key={p.id}
-                    p={p}
-                    isMe={p.id === localId || p.id === myPlayerId}
-                    isHost={p.id === hostId}
-                    color="primary"
-                  />
+                    <PlayerCard
+                      key={p.id}
+                      p={p}
+                      isMe={p.id === myPlayerId}
+                      isHost={p.id === hostId}
+                      color="primary"
+                    />
                 ))}
                 {teamA.length === 0 && <EmptySlot />}
               </div>
@@ -263,13 +263,13 @@ export default function Lobby() {
               </div>
               <div className="space-y-3">
                 {gameState.players.map((p) => (
-                  <PlayerCard
-                    key={p.id}
-                    p={p}
-                    isMe={p.id === localId || p.id === myPlayerId}
-                    isHost={p.id === hostId}
-                    color="secondary"
-                  />
+                    <PlayerCard
+                      key={p.id}
+                      p={p}
+                      isMe={p.id === myPlayerId}
+                      isHost={p.id === hostId}
+                      color="secondary"
+                    />
                 ))}
                 {gameState.players.length === 0 && <EmptySlot />}
               </div>
@@ -286,13 +286,13 @@ export default function Lobby() {
               </div>
               <div className="space-y-3">
                 {teamB.map((p) => (
-                  <PlayerCard
-                    key={p.id}
-                    p={p}
-                    isMe={p.id === localId || p.id === myPlayerId}
-                    isHost={p.id === hostId}
-                    color="secondary"
-                  />
+                    <PlayerCard
+                      key={p.id}
+                      p={p}
+                      isMe={p.id === myPlayerId}
+                      isHost={p.id === hostId}
+                      color="secondary"
+                    />
                 ))}
                 {teamB.length === 0 && <EmptySlot />}
               </div>

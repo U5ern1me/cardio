@@ -1,6 +1,6 @@
 # AGENTS.md — Cardio Agent Context
 
-**Cardio** is a real-time multiplayer card game platform. Six games share one monorepo: a Vite+React frontend and a standalone Express+WebSocket backend. No database — all state is in-process server memory.
+**Cardio** is a real-time multiplayer card game platform. Six games share one monorepo: a Vite+React frontend and a standalone Express+WebSocket backend. Runtime state is authoritative in memory and persisted to local SQLite snapshots/event log for crash recovery.
 
 For deeper context, see [`docs/agent/`](./docs/agent/).
 

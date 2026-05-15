@@ -7,13 +7,11 @@ export default function HostControls() {
 
   if (!gameState || !myPlayerId) return null;
   const hostId = gameState.hostPlayerId;
-  const localId = localStorage.getItem("cardio_playerId");
 
   // Fallback: If no explicit hostPlayerId, default to the first player in state.players
   const effectiveHostId =
     hostId || (gameState.players.length > 0 ? gameState.players[0].id : null);
-  const isEffectiveHost =
-    myPlayerId === effectiveHostId || localId === effectiveHostId;
+  const isEffectiveHost = myPlayerId === effectiveHostId;
 
   if (!isEffectiveHost) return null;
 

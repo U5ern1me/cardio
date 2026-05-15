@@ -13,14 +13,18 @@ interface Session {
   clients: Map<WebSocket, string>; // ws → playerId
   state: GameState; // authoritative state (any shape)
   gameType: GameType;
-  hostPlayerId: string | null; // first player to JOIN_LOBBY
-  cleanupTimer: ReturnType<typeof setTimeout> | null;
+  hostPlayerId: string | null;
+  stateVersion: number;
+  lifecycleState: "LOBBY" | "ACTIVE" | "COMPLETED" | "IDLE_EMPTY" | "ENDED";
+  inviteToken: string;
+  validReconnectVersions: Record<string, number>;
+  connectionEpochByPlayer: Record<string, number>;
 }
 ```
 
 Sessions live in `const sessions: Record<string, Session>`.  
 Session IDs: 4-char uppercase hex, collision-resistant.  
-Player IDs: 8-char UUID fragment, generated client-side in `Lobby.tsx`.
+Player IDs: server-authoritative random hex IDs generated only on `JOIN_LOBBY`.
 
 ### MAX_PLAYERS per game
 
@@ -36,11 +40,11 @@ LITERATURE: 8 | COUP: 6 | SECRET_HITLER: 10 | HANABI: 5 | LOVE_LETTER: 4 | SPADE
 
 ### Reconnection Flow
 
-1. Client disconnect → player marked `isConnected: false` → state broadcast.
-2. If no clients remain in session, cleanup timer starts (120 s).
-3. Client reconnects → sends `JOIN_SESSION` + `JOIN_LOBBY` with same playerId.
-4. Server matches playerId, cancels cleanup timer, updates socket mapping.
-5. `GameContext.tsx` auto-reconnects from `localStorage` (`cardio_sessionId`, `cardio_playerId`, `cardio_playerName`). Uses exponential backoff, max 8 attempts.
+1. `JOIN_SESSION` requires either an invite token (new join) or reconnect token (seat reclaim).
+2. Reconnect uses signed token claims `{sid, pid, reconnectVersion}` with monotonic rotation.
+3. Disconnects are finalized via orchestrator grace window to absorb brief network flaps.
+4. Cleanup/inactivity/disconnect all run via one `SessionOrchestrator` timer service.
+5. State updates include `stateVersion`; mutating actions can provide `expectedStateVersion` for stale-write rejection.
 
 ---
 
@@ -50,9 +54,9 @@ LITERATURE: 8 | COUP: 6 | SECRET_HITLER: 10 | HANABI: 5 | LOVE_LETTER: 4 | SPADE
 
 | Type                   | Payload                                   | Notes                                                                      |
 | ---------------------- | ----------------------------------------- | -------------------------------------------------------------------------- |
-| `CREATE_SESSION`       | `{gameType}`                              | Server responds with `SESSION_CREATED`                                     |
-| `JOIN_SESSION`         | `{sessionId}`                             | Server responds with `SESSION_JOINED` + broadcasts state                   |
-| `JOIN_LOBBY`           | `{player: {id, name, team?, seatIndex?}}` | Adds or reconnects player                                                  |
+| `CREATE_SESSION`       | `{gameType, messageId?}`                  | Server responds with `SESSION_CREATED` (includes invite + one-time session token) |
+| `JOIN_SESSION`         | `{sessionId, inviteToken? or reconnectToken?, joinAs?, messageId?}` | Invite-only join authorization and reconnect resume                         |
+| `JOIN_LOBBY`           | `{sessionToken, player: {name, team?, seatIndex?}, messageId}` | Claims a lobby seat with server-issued one-time token                      |
 | `START_GAME`           | `{}`                                      | Host only; delegates to game handler                                       |
 | `ASK_CARD`             | `{askerId, targetId, card}`               | Literature only (server trusts socket-bound actor identity, not askerId)   |
 | `CLAIM_BOOK`           | `{claimerId, halfSuit}`                   | Literature only (server trusts socket-bound actor identity, not claimerId) |
@@ -64,9 +68,9 @@ LITERATURE: 8 | COUP: 6 | SECRET_HITLER: 10 | HANABI: 5 | LOVE_LETTER: 4 | SPADE
 
 | Type              | Payload                                                      |
 | ----------------- | ------------------------------------------------------------ |
-| `SESSION_CREATED` | `{sessionId, gameType}`                                      |
-| `SESSION_JOINED`  | `{sessionId, gameType}`                                      |
-| `STATE_UPDATE`    | `{state (sanitized + hostPlayerId), yourPlayerId, gameType}` |
+| `SESSION_CREATED` | `{sessionId, gameType, inviteToken, sessionToken}`           |
+| `SESSION_JOINED`  | `{sessionId, gameType, resumed, role, stateVersion, lifecycleState, sessionToken?/reconnectToken?}` |
+| `STATE_UPDATE`    | `{state (sanitized + hostPlayerId), yourPlayerId, gameType, stateVersion, lifecycleState, reconnectToken?, capabilities}` |
 | `ERROR`           | `{message}`                                                  |
 
 `actorId: myPlayerId` is injected by `server/index.ts` before dispatching to every handler.
@@ -227,7 +231,7 @@ Tests live co-located with the modules they test:
 - `server/games/*.test.ts` — Server handler integration tests (e.g., Literature: 12, Secret Hitler: 8)
 - `server/index.test.ts` — Server core logic (Sanitization)
 
-There are 130+ tests across the codebase.
+There are 140+ tests across the codebase, including multiplayer chaos/recovery integration tests for malformed payloads, reconnect storms, stale token rejection, host migration, and snapshot replay recovery.
 
 Target pure functions in `logic.ts` for unit tests. Handler tests should verify validation, happy path, and edge cases (turn enforcement, missing fields, game-over).
 
