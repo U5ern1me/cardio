@@ -65,6 +65,10 @@ export class SessionOrchestrator<TSession extends OrchestratorSessionView> {
     this.disconnectDeadlines.clear();
   }
 
+  isRunning(): boolean {
+    return this.intervalHandle !== null;
+  }
+
   scheduleCleanup(sessionId: string, nowMs = Date.now()) {
     this.cleanupDeadlines.set(sessionId, nowMs + this.cleanupDelayMs);
   }
@@ -94,6 +98,22 @@ export class SessionOrchestrator<TSession extends OrchestratorSessionView> {
   clearSession(sessionId: string) {
     this.cleanupDeadlines.delete(sessionId);
     this.disconnectDeadlines.delete(sessionId);
+  }
+
+  getDiagnostics() {
+    let disconnectCount = 0;
+    for (const byPlayer of this.disconnectDeadlines.values()) {
+      disconnectCount += byPlayer.size;
+    }
+    return {
+      running: this.isRunning(),
+      tickIntervalMs: this.tickIntervalMs,
+      inactivityTimeoutMs: this.inactivityTimeoutMs,
+      cleanupDelayMs: this.cleanupDelayMs,
+      disconnectGraceMs: this.disconnectGraceMs,
+      pendingCleanupSessions: this.cleanupDeadlines.size,
+      pendingDisconnects: disconnectCount,
+    };
   }
 
   private tick(nowMs = Date.now()) {

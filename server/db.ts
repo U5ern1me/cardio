@@ -3,6 +3,11 @@ import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { GameType } from "../src/shared/types.js";
+import { SQLITE_MIGRATIONS } from "./persistence/migrationDefinitions.js";
+import {
+  applyMigrations,
+  getAppliedMigrationIds,
+} from "./persistence/migrations.js";
 import type { SessionLifecycleState } from "./sessionLifecycle.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -21,39 +26,14 @@ db.pragma("synchronous = FULL");
 db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000");
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    gameType TEXT NOT NULL,
-    state JSON NOT NULL,
-    hostPlayerId TEXT,
-    schemaVersion INTEGER NOT NULL DEFAULT 1,
-    updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+const migrationReport = applyMigrations(db, SQLITE_MIGRATIONS);
 
-  CREATE TABLE IF NOT EXISTS session_snapshots (
-    sessionId TEXT PRIMARY KEY,
-    sequence INTEGER NOT NULL,
-    schemaVersion INTEGER NOT NULL,
-    payload TEXT NOT NULL,
-    payloadChecksum TEXT NOT NULL,
-    updatedAtEpochMs INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS session_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sessionId TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    eventType TEXT NOT NULL,
-    payload TEXT,
-    payloadChecksum TEXT,
-    createdAtEpochMs INTEGER NOT NULL,
-    UNIQUE(sessionId, sequence)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_session_events_session_sequence
-    ON session_events(sessionId, sequence);
-`);
+export function getPersistenceMigrationState() {
+  return {
+    latestMigrationId: migrationReport.latestId,
+    appliedMigrationIds: getAppliedMigrationIds(db),
+  };
+}
 
 export interface PersistedSessionEnvelope {
   sessionId: string;
@@ -75,6 +55,25 @@ export interface RecoveryReport {
   sessions: PersistedSessionEnvelope[];
   corruptedSessionIds: string[];
   replayedFromEvents: number;
+}
+
+export interface EventReplayReport {
+  sessionId: string;
+  replayedEvents: number;
+  rejectedEvents: number;
+  deleted: boolean;
+  recovered: PersistedSessionEnvelope | null;
+}
+
+export interface PersistenceHealth {
+  ok: boolean;
+  schemaVersion: number;
+  latestMigrationId: number;
+  appliedMigrationIds: number[];
+  snapshotCount: number;
+  eventCount: number;
+  integrity: string;
+  error?: string;
 }
 
 interface SnapshotRow {
@@ -341,6 +340,48 @@ function readEvents(sessionId: string, afterSequence: number): EventRow[] {
     .all(sessionId, afterSequence) as EventRow[];
 }
 
+export function replaySessionFromEvents(sessionId: string): EventReplayReport {
+  const events = readEvents(sessionId, 0);
+  let recovered: PersistedSessionEnvelope | null = null;
+  let rejectedEvents = 0;
+  let deleted = false;
+
+  for (const eventRow of events) {
+    if (
+      eventRow.eventType === "session-deleted" ||
+      eventRow.eventType === "host-ended-game"
+    ) {
+      deleted = true;
+      recovered = null;
+      continue;
+    }
+    if (!eventRow.payload || !eventRow.payloadChecksum) {
+      rejectedEvents += 1;
+      continue;
+    }
+    const parsed = parseEnvelopePayload(
+      eventRow.sessionId,
+      PERSISTENCE_SCHEMA_VERSION,
+      eventRow.payload,
+      eventRow.payloadChecksum,
+    );
+    if (parsed) {
+      recovered = parsed;
+      deleted = false;
+    } else {
+      rejectedEvents += 1;
+    }
+  }
+
+  return {
+    sessionId,
+    replayedEvents: events.length,
+    rejectedEvents,
+    deleted,
+    recovered: deleted ? null : recovered,
+  };
+}
+
 export function recoverSession(
   sessionId: string,
 ): PersistedSessionEnvelope | null {
@@ -361,29 +402,35 @@ export function recoverSession(
     }
   }
 
-  const events = readEvents(sessionId, fromSequence);
-  for (const eventRow of events) {
-    if (
-      eventRow.eventType === "session-deleted" ||
-      eventRow.eventType === "host-ended-game"
-    ) {
-      deleted = true;
-      recovered = null;
-      continue;
+  const replay = replaySessionFromEvents(sessionId);
+  if (fromSequence > 0) {
+    const replayAfterSnapshot = readEvents(sessionId, fromSequence);
+    for (const eventRow of replayAfterSnapshot) {
+      if (
+        eventRow.eventType === "session-deleted" ||
+        eventRow.eventType === "host-ended-game"
+      ) {
+        deleted = true;
+        recovered = null;
+        continue;
+      }
+      if (!eventRow.payload || !eventRow.payloadChecksum) {
+        continue;
+      }
+      const parsed = parseEnvelopePayload(
+        eventRow.sessionId,
+        PERSISTENCE_SCHEMA_VERSION,
+        eventRow.payload,
+        eventRow.payloadChecksum,
+      );
+      if (parsed) {
+        recovered = parsed;
+        deleted = false;
+      }
     }
-    if (!eventRow.payload || !eventRow.payloadChecksum) {
-      continue;
-    }
-    const parsed = parseEnvelopePayload(
-      eventRow.sessionId,
-      PERSISTENCE_SCHEMA_VERSION,
-      eventRow.payload,
-      eventRow.payloadChecksum,
-    );
-    if (parsed) {
-      recovered = parsed;
-      deleted = false;
-    }
+  } else {
+    recovered = replay.recovered;
+    deleted = replay.deleted;
   }
 
   if (deleted) {
@@ -486,6 +533,55 @@ export function getAllSessions() {
     hostPlayerId: session.hostPlayerId,
     schemaVersion: PERSISTENCE_SCHEMA_VERSION,
   }));
+}
+
+export function getPersistenceHealth(): PersistenceHealth {
+  try {
+    const quickCheck = db.pragma("quick_check", { simple: true }) as string;
+    const snapshotCount = Number(
+      (db
+        .prepare("SELECT COUNT(*) as count FROM session_snapshots")
+        .get() as { count: number }).count,
+    );
+    const eventCount = Number(
+      (db
+        .prepare("SELECT COUNT(*) as count FROM session_events")
+        .get() as { count: number }).count,
+    );
+    return {
+      ok: quickCheck === "ok",
+      schemaVersion: PERSISTENCE_SCHEMA_VERSION,
+      latestMigrationId: migrationReport.latestId,
+      appliedMigrationIds: getAppliedMigrationIds(db),
+      snapshotCount,
+      eventCount,
+      integrity: quickCheck,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      schemaVersion: PERSISTENCE_SCHEMA_VERSION,
+      latestMigrationId: migrationReport.latestId,
+      appliedMigrationIds: getAppliedMigrationIds(db),
+      snapshotCount: 0,
+      eventCount: 0,
+      integrity: "error",
+      error: error instanceof Error ? error.message : "unknown db error",
+    };
+  }
+}
+
+export function recordSeatTransferAudit(
+  sessionId: string,
+  transferToken: string,
+  sourcePlayerId: string,
+) {
+  db.prepare(
+    `
+      INSERT INTO seat_transfer_audit (sessionId, transferToken, sourcePlayerId, assignedAtEpochMs)
+      VALUES (?, ?, ?, ?)
+    `,
+  ).run(sessionId, transferToken, sourcePlayerId, Date.now());
 }
 
 export function __dangerouslyCorruptSnapshotForTest(sessionId: string) {

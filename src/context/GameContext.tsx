@@ -1,42 +1,21 @@
 import {
-  createContext,
-  useContext,
   useState,
   useCallback,
   useRef,
   useEffect,
 } from "react";
 import type { BaseGameState as GameState, GameType } from "../shared/types";
-import { parseServerEvent } from "../shared/protocol";
+import { parseServerEvent, PROTOCOL_VERSION } from "../shared/protocol";
+import {
+  GameContext,
+  type ConnectionStatus,
+  type OutgoingMessage,
+} from "./GameContextStore";
 
 const MAX_RECONNECT_ATTEMPTS = 8;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 15_000;
 const MAX_PENDING_MESSAGES = 200;
-
-type ConnectionStatus = "connected" | "disconnected" | "reconnecting";
-type OutgoingMessage = { type: string; [key: string]: unknown };
-
-interface GameContextProps {
-  gameState: GameState | null;
-  myPlayerId: string | null;
-  cardCounts: Record<string, number>;
-  error: string | null;
-  connectionStatus: ConnectionStatus;
-  inviteToken: string | null;
-  createLANSession: (gameType: GameType) => void;
-  connectToLAN: (sessionId: string, inviteToken: string) => void;
-  sendMessage: (msg: OutgoingMessage) => void;
-  sendAction: (action: Record<string, unknown>) => void;
-  state: GameState | null;
-  playerId: string | null;
-  isConnected: boolean;
-  clearSession: () => void;
-}
-
-export const GameContext = createContext<GameContextProps>(
-  {} as GameContextProps,
-);
 
 const MUTATING_MESSAGE_TYPES = new Set([
   "JOIN_LOBBY",
@@ -63,7 +42,11 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
   const [error, setError] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("disconnected");
-  const [inviteToken, setInviteTokenState] = useState<string | null>(null);
+  const [inviteToken, setInviteTokenState] = useState<string | null>(() =>
+    typeof window === "undefined"
+      ? null
+      : localStorage.getItem("cardio_inviteToken"),
+  );
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -77,7 +60,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
   const reconnectTokenRef = useRef<string | null>(null);
   const pendingLobbyJoinRef = useRef<OutgoingMessage | null>(null);
   const reconnectingRef = useRef(false);
-  const inviteTokenRef = useRef<string | null>(null);
+  const inviteTokenRef = useRef<string | null>(inviteToken);
 
   const setReconnectToken = useCallback((token: string | null) => {
     reconnectTokenRef.current = token;
@@ -115,8 +98,14 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const attachMessageMetadata = useCallback((msg: OutgoingMessage) => {
     const out: OutgoingMessage = { ...msg };
+    if (typeof out.protocolVersion !== "number") {
+      out.protocolVersion = PROTOCOL_VERSION;
+    }
     if (typeof out.messageId !== "string") {
       out.messageId = crypto.randomUUID();
+    }
+    if (typeof out.requestId !== "string") {
+      out.requestId = out.messageId;
     }
     if (
       MUTATING_MESSAGE_TYPES.has(out.type) &&
@@ -238,6 +227,36 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
               } else if (data.yourPlayerId === null) {
                 setMyPlayerId(null);
               }
+              break;
+            }
+            case "SEAT_TRANSFER_GRANTED": {
+              if (typeof data.reconnectToken === "string") {
+                setReconnectToken(data.reconnectToken);
+              }
+              if (typeof data.sessionId === "string" && data.reconnectToken) {
+                socket.send(
+                  JSON.stringify(
+                    attachMessageMetadata({
+                      type: "JOIN_SESSION",
+                      sessionId: data.sessionId,
+                      reconnectToken: data.reconnectToken,
+                    }),
+                  ),
+                );
+              }
+              break;
+            }
+            case "ACK":
+            case "SEAT_TRANSFER_REQUEST": {
+              break;
+            }
+            case "REJECT": {
+              const message =
+                typeof data.message === "string"
+                  ? data.message
+                  : "Request rejected";
+              setError(message);
+              setTimeout(() => setError(null), 4000);
               break;
             }
             case "ERROR": {
@@ -433,10 +452,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
 
     const savedSessionId = localStorage.getItem("cardio_sessionId");
     const savedReconnectToken = localStorage.getItem("cardio_reconnectToken");
-    const savedInviteToken = localStorage.getItem("cardio_inviteToken");
-    if (savedInviteToken) {
-      setInviteToken(savedInviteToken);
-    }
 
     if (savedSessionId && savedReconnectToken && !gameState) {
       reconnectingRef.current = true;
@@ -458,7 +473,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({
         clearTimeout(reconnectTimerRef.current);
       }
     };
-  }, [attachMessageMetadata, gameState, initWs, setInviteToken]);
+  }, [attachMessageMetadata, gameState, initWs]);
 
   return (
     <GameContext.Provider
@@ -514,5 +529,3 @@ function toNumberRecord(value: Record<string, unknown> | null): Record<string, n
   }
   return out;
 }
-
-export const useGame = () => useContext(GameContext);

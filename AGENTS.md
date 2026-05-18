@@ -80,8 +80,8 @@ cardio/
 
 All messages are JSON. See [`docs/agent/architecture.md`](./docs/agent/architecture.md) for the full message table.
 
-**Client → Server:** `CREATE_SESSION`, `JOIN_SESSION`, `JOIN_LOBBY`, `START_GAME`, `ASK_CARD`, `CLAIM_BOOK`, `COUP_ACTION`, `SECRET_HITLER_ACTION`, `GAME_ACTION`  
-**Server → Client:** `SESSION_CREATED`, `SESSION_JOINED`, `STATE_UPDATE`, `ERROR`
+**Client → Server:** `CREATE_SESSION`, `JOIN_SESSION`, `JOIN_LOBBY`, `START_GAME`, `ASK_CARD`, `CLAIM_BOOK`, `COUP_ACTION`, `SECRET_HITLER_ACTION`, `GAME_ACTION`, `REQUEST_SEAT_TRANSFER`, `HOST_ACTION`  
+**Server → Client:** `SESSION_CREATED`, `SESSION_JOINED`, `STATE_UPDATE`, `SEAT_TRANSFER_REQUEST`, `SEAT_TRANSFER_GRANTED`, `ACK`, `REJECT`, `ERROR`
 
 ### Session Lifecycle
 
@@ -97,7 +97,7 @@ See [`docs/agent/architecture.md#adding-a-game`](./docs/agent/architecture.md#ad
 
 ### State Sanitization
 
-`sanitizeStateForPlayer()` in `server/index.ts` strips private information before broadcast (hands, roles, etc.). Each game has its own sanitization branch. When adding game-specific private state, add a branch there.
+`sanitizeStateForPlayer()` in `server/state/gameState.ts` strips private information before broadcast (hands, roles, etc.). Each game has its own sanitization branch. When adding game-specific private state, add a branch there.
 
 ### No Turn Enforcement by Default
 

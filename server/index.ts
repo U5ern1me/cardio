@@ -5,20 +5,15 @@ import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db.js";
-import * as LiteratureHandler from "./games/literature.js";
-import * as CoupHandler from "./games/coup.js";
-import * as SecretHitlerHandler from "./games/secretHitler.js";
-import * as HanabiHandler from "./games/hanabi.js";
-import * as LoveLetterHandler from "./games/love_letter.js";
-import * as SpadesHandler from "./games/spades.js";
-import { logEvent, classifyError } from "./infra/logger.js";
+import { dispatchGameAction } from "./games/dispatcher.js";
+import { logEvent } from "./infra/logger.js";
+import { metrics } from "./infra/metrics.js";
 import { TokenBucket } from "./network/tokenBucket.js";
 import {
   parseClientMessage,
-  parseServerEvent,
   type ClientMessage,
-  type ServerEvent,
 } from "./protocol/schemas.js";
+import { sendAck, sendError, sendServerEvent } from "./protocol/respond.js";
 import {
   issueInviteToken,
   issueReconnectToken,
@@ -32,23 +27,18 @@ import {
   type SessionLifecycleState,
 } from "./sessionLifecycle.js";
 import { SessionOrchestrator } from "./sessionOrchestrator.js";
-import type { GameState as LiteratureState } from "../src/games/literature/types.js";
-import type { GameState as CoupState } from "../src/games/coup/types.js";
-import type { SecretHitlerState } from "../src/games/secretHitler/types.js";
-import type { GameState as HanabiState } from "../src/games/hanabi/types.js";
-import type { GameState as LoveLetterState } from "../src/games/love_letter/types.js";
-import type { GameState as SpadesState } from "../src/games/spades/types.js";
+import {
+  createEmptyState,
+  sanitizeStateForPlayer,
+  type GameStateUnion,
+} from "./state/gameState.js";
+import {
+  MAX_SUPPORTED_PROTOCOL_VERSION,
+  MIN_SUPPORTED_PROTOCOL_VERSION,
+  SERVER_ERROR_CODES,
+} from "../src/shared/protocolContracts.js";
 import type { BaseGameState, GameType, Move } from "../src/shared/types.js";
 import type { PersistedSessionEnvelope } from "./db.js";
-
-type GameStateUnion =
-  | LiteratureState
-  | CoupState
-  | SecretHitlerState
-  | HanabiState
-  | LoveLetterState
-  | SpadesState
-  | BaseGameState;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -86,6 +76,7 @@ const MAX_WS_MESSAGE_BYTES = 64 * 1024;
 const MAX_MOVE_LOG_ENTRIES = 50;
 const CLIENT_MESSAGE_TTL_MS = 2 * 60 * 1000;
 const PENDING_JOIN_NONCE_TTL_MS = 20 * 60 * 1000;
+const SEAT_TRANSFER_TOKEN_TTL_MS = 60 * 1000;
 
 const MAX_PLAYERS: Record<string, number> = {
   LITERATURE: 8,
@@ -110,6 +101,10 @@ interface Session {
   inviteToken: string;
   processedMessageIds: Map<string, number>;
   pendingJoinNonces: Map<string, number>;
+  pendingSeatTransfers: Map<
+    string,
+    { ws: WebSocket; requestedBy: string; requestedAtEpochMs: number; expiresAt: number }
+  >;
   validReconnectVersions: Record<string, number>;
   connectionEpochByPlayer: Record<string, number>;
 }
@@ -160,6 +155,7 @@ function hydrateSessionFromEnvelope(envelope: PersistedSessionEnvelope): Session
     inviteToken: restoreInviteToken(envelope.sessionId, envelope.inviteToken),
     processedMessageIds: new Map(),
     pendingJoinNonces: new Map(),
+    pendingSeatTransfers: new Map(),
     validReconnectVersions: envelope.validReconnectVersions ?? {},
     connectionEpochByPlayer: envelope.connectionEpochByPlayer ?? {},
   };
@@ -188,45 +184,6 @@ function restoreSessionsFromPersistence(trigger: string) {
 restoreSessionsFromPersistence("startup");
 
 // ─── Helpers ─────────────────────────────────────────────
-
-function sendError(
-  ws: WebSocket,
-  message: string,
-  context: {
-    sessionId?: string;
-    playerId?: string | null;
-    messageType?: string;
-    reconnectTraceId?: string;
-  } = {},
-) {
-  logEvent("warn", "ws.error", {
-    sessionId: context.sessionId,
-    playerId: context.playerId ?? undefined,
-    messageType: context.messageType,
-    reconnectTraceId: context.reconnectTraceId,
-    errorClass: classifyError(message),
-    detail: message,
-  });
-  sendServerEvent(ws, { type: "ERROR", message });
-}
-
-function sendServerEvent(
-  ws: WebSocket,
-  event: ServerEvent,
-) {
-  if (ws.readyState !== WebSocket.OPEN) {
-    return;
-  }
-  const parsed = parseServerEvent(event);
-  if (!parsed.ok) {
-    logEvent("error", "ws.invalid_server_event_blocked", {
-      errorClass: "SERVER_EVENT_SCHEMA",
-      detail: parsed.error,
-    });
-    return;
-  }
-  ws.send(JSON.stringify(parsed.data));
-}
 
 function buildPersistedEnvelope(
   sessionId: string,
@@ -370,7 +327,8 @@ function isMutatingMessageType(type: ClientMessage["type"]): boolean {
     type === "GIVE_HINT" ||
     type === "MOVE_CARD" ||
     type === "GAME_ACTION" ||
-    type === "HOST_ACTION"
+    type === "HOST_ACTION" ||
+    type === "REQUEST_SEAT_TRANSFER"
   );
 }
 
@@ -384,6 +342,11 @@ function pruneSessionCaches(session: Session) {
   for (const [nonce, expiresAt] of session.pendingJoinNonces.entries()) {
     if (expiresAt <= now) {
       session.pendingJoinNonces.delete(nonce);
+    }
+  }
+  for (const [token, transfer] of session.pendingSeatTransfers.entries()) {
+    if (transfer.expiresAt <= now || transfer.ws.readyState !== WebSocket.OPEN) {
+      session.pendingSeatTransfers.delete(token);
     }
   }
 }
@@ -431,6 +394,7 @@ function broadcastState(sessionId: string) {
 
   pruneSessionCaches(session);
   persistSessionState(sessionId, "broadcast-state");
+  metrics.increment("state_broadcast_total", 1, { gameType: session.gameType });
 
   for (const [client, playerId] of session.clients.entries()) {
     if (client.readyState === WebSocket.OPEN) {
@@ -503,7 +467,7 @@ function setPlayerConnected(
   let changed = false;
   session.state = {
     ...session.state,
-    players: session.state.players.map((p: any) =>
+    players: session.state.players.map((p) =>
       p.id === playerId
         ? (() => {
             if (p.isConnected !== connected) {
@@ -549,238 +513,6 @@ function pruneDeadClients(session: Session) {
   for (const ws of toDelete) {
     session.clients.delete(ws);
   }
-}
-
-function sanitizeStateForPlayer(
-  state: GameStateUnion,
-  playerId: string,
-): GameStateUnion {
-  if (state.gameType === "LITERATURE") {
-    const cardCounts: Record<string, number> = {};
-    for (const [id, hand] of Object.entries(state.hands || {})) {
-      cardCounts[id] = (hand as any[]).length;
-    }
-    const { deck, ...rest } = state;
-    return {
-      ...rest,
-      hands: { [playerId]: state.hands[playerId] || [] },
-      cardCounts,
-      playerCardCounts: cardCounts,
-    } as any;
-  }
-
-  if (state.gameType === "COUP") {
-    const players = state.players.map((p: any) => ({
-      ...p,
-      influences:
-        !p.influences || p.id === playerId
-          ? p.influences
-          : p.influences.map((i: any) =>
-              i.isRevealed ? i : { role: "HIDDEN", isRevealed: false },
-            ),
-    }));
-    return { ...state, players };
-  }
-
-  if (state.gameType === "SECRET_HITLER") {
-    const me = state.players.find((p: any) => p.id === playerId);
-    const visiblePlayers = state.players.map((p: any) => ({
-      ...p,
-      role: p.id === playerId ? p.role : undefined,
-      partyMembership: p.id === playerId ? p.partyMembership : undefined,
-    }));
-
-    const fascists = state.players.filter((p: any) => p.role === "FASCIST");
-    const hitler = state.players.find((p: any) => p.role === "HITLER");
-    if (me?.role === "FASCIST") {
-      for (const other of fascists) {
-        const target = visiblePlayers.find((p: any) => p.id === other.id);
-        if (target) target.role = other.role;
-      }
-      if (hitler) {
-        const target = visiblePlayers.find((p: any) => p.id === hitler.id);
-        if (target) target.role = "HITLER";
-      }
-    } else if (me?.role === "HITLER") {
-      const playerCount = state.players.length;
-      if (playerCount <= 6) {
-        for (const fascist of fascists) {
-          const target = visiblePlayers.find((p: any) => p.id === fascist.id);
-          if (target) target.role = "FASCIST";
-        }
-      }
-    }
-
-    return {
-      ...state,
-      players: visiblePlayers,
-      presidentCards: me?.id === state.presidentId ? state.presidentCards : [],
-      chancellorCards:
-        me?.id === state.nominatedChancellorId ? state.chancellorCards : [],
-      policyPeek:
-        me?.id === state.presidentId && state.executiveAction === "POLICY_PEEK"
-          ? state.policyPeek
-          : null,
-    };
-  }
-
-  if (state.gameType === "HANABI") {
-    const me = state.players.find((p: any) => p.id === playerId);
-    return {
-      ...state,
-      players: state.players.map((p: any) => ({
-        ...p,
-        // Hide hand from the player themselves
-        hand:
-          p.id === playerId
-            ? p.hand.map((card: any) => ({
-                id: card.id,
-                color: "HIDDEN",
-                rank: 0,
-                hintedColor: card.hintedColor,
-                hintedRank: card.hintedRank,
-              }))
-            : p.hand,
-      })),
-    };
-  }
-
-  if (state.gameType === "LOVE_LETTER") {
-    return {
-      ...state,
-      deck: [], // Hide deck completely
-      players: state.players.map((p: any) => ({
-        ...p,
-        hand:
-          p.id === playerId
-            ? p.hand
-            : p.hand.map((card: any) => ({ role: "HIDDEN", value: 0 })),
-      })),
-      setAsideCard: state.setAsideCard ? { role: "HIDDEN", value: 0 } : null,
-      priestPeeks: state.priestPeeks
-        ? state.priestPeeks.filter((peek: any) => peek.viewerId === playerId)
-        : [],
-    };
-  }
-
-  if (state.gameType === "SPADES") {
-    return {
-      ...state,
-      deck: [],
-      players: state.players.map((p: any) => ({
-        ...p,
-        hand: p.id === playerId ? p.hand : [],
-      })),
-    };
-  }
-
-  return state;
-}
-
-function createEmptyState(
-  sessionId: string,
-  gameType: GameType,
-): GameStateUnion {
-  const base = {
-    sessionId,
-    gameType,
-    phase: "LOBBY",
-    players: [],
-    activePlayerIndex: 0,
-    lastMove: null,
-    moveLog: [],
-  };
-
-  if (gameType === "LITERATURE") {
-    return {
-      ...base,
-      hands: {},
-      books: [],
-      houseRules: {
-        mandatory_declaration: false,
-        announce_one_card: false,
-        high_book_double: false,
-        claim_any_turn: false,
-        claim_passes_turn: false,
-      },
-      scores: { teamA: 0, teamB: 0 },
-    };
-  }
-
-  if (gameType === "COUP") {
-    return {
-      ...base,
-      deck: [],
-      pendingAction: null,
-    };
-  }
-
-  if (gameType === "SECRET_HITLER") {
-    return {
-      ...base,
-      drawPile: [],
-      discardPile: [],
-      electionTracker: 0,
-      liberalPolicies: 0,
-      fascistPolicies: 0,
-      presidentId: null,
-      nominatedChancellorId: null,
-      chancellorId: null,
-      previousPresidentId: null,
-      previousChancellorId: null,
-      presidentCards: [],
-      chancellorCards: [],
-      votes: {},
-      vetoRequested: false,
-      executiveAction: null,
-      policyPeek: null,
-      specialElectionReturnIndex: null,
-      winner: null,
-      winnerReason: null,
-      investigateResults: {},
-    };
-  }
-
-  if (gameType === "HANABI") {
-    return {
-      ...base,
-      deck: [],
-      playArea: { RED: 0, BLUE: 0, GREEN: 0, YELLOW: 0, WHITE: 0 },
-      discardPile: [],
-      hintTokens: 8,
-      mistakeTokens: 0,
-      score: 0,
-      turnsLeft: null,
-    };
-  }
-
-  if (gameType === "LOVE_LETTER") {
-    return {
-      ...base,
-      deck: [],
-      setAsideCard: null,
-      discardPile: [],
-      eliminatedThisRound: [],
-      currentRound: 1,
-      handmaidProtections: [],
-      priestPeeks: [],
-    };
-  }
-
-  if (gameType === "SPADES") {
-    return {
-      ...base,
-      deck: [],
-      currentTrick: { leadSuit: "SPADE", cards: [] },
-      trickHistory: [],
-      teamAScore: { tricks: 0, bags: 0, score: 0 },
-      teamBScore: { tricks: 0, bags: 0, score: 0 },
-      allPlayersBid: false,
-      spadesBroken: false,
-    };
-  }
-
-  return base;
 }
 
 // ─── Heartbeat ───────────────────────────────────────────
@@ -876,13 +608,50 @@ const sessionOrchestrator = new SessionOrchestrator<Session>({
 
 export { sanitizeStateForPlayer };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function extractRequestId(data: ClientMessage): string | undefined {
+  if ("requestId" in data && typeof data.requestId === "string") {
+    return data.requestId;
+  }
+  if ("messageId" in data && typeof data.messageId === "string") {
+    return data.messageId;
+  }
+  return undefined;
+}
+
+function extractRequestIdFromRaw(raw: unknown): string | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  if (typeof raw.requestId === "string") {
+    return raw.requestId;
+  }
+  if (typeof raw.messageId === "string") {
+    return raw.messageId;
+  }
+  return undefined;
+}
+
+function extractProtocolVersion(raw: unknown): number | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const version = raw.protocolVersion;
+  return typeof version === "number" ? version : undefined;
+}
+
 wss.on("connection", (ws) => {
   logEvent("info", "ws.connected");
+  metrics.increment("ws_connections_total");
   wsAliveMap.set(ws, true);
   let currentSessionId: string | null = null;
   let myPlayerId: string | null = null;
   let myRole: SessionRole = "SPECTATOR";
   let myConnectionEpoch = 0;
+
   const rateLimiter = new TokenBucket({
     capacity: RATE_LIMIT_BUCKET_CAPACITY,
     refillTokensPerSecond: RATE_LIMIT_REFILL_PER_SECOND,
@@ -892,9 +661,10 @@ wss.on("connection", (ws) => {
     sessionId: string,
     session: Session,
     playerId: string,
+    socket: WebSocket = ws,
   ) => {
     for (const [oldWs, oldPid] of session.clients.entries()) {
-      if (oldPid === playerId && oldWs !== ws) {
+      if (oldPid === playerId && oldWs !== socket) {
         session.clients.delete(oldWs);
         try {
           oldWs.close(4001, "Replaced by new connection");
@@ -912,11 +682,9 @@ wss.on("connection", (ws) => {
       }
     }
 
-    session.clients.set(ws, playerId);
+    session.clients.set(socket, playerId);
     sessionOrchestrator.cancelCleanup(sessionId);
     sessionOrchestrator.cancelDisconnect(sessionId, playerId);
-    myPlayerId = playerId;
-    myRole = session.hostPlayerId === playerId ? "HOST" : "PLAYER";
 
     const connectedChanged = setPlayerConnected(session, playerId, true);
     if (connectedChanged) {
@@ -925,7 +693,12 @@ wss.on("connection", (ws) => {
 
     const nextEpoch = (session.connectionEpochByPlayer[playerId] ?? 0) + 1;
     session.connectionEpochByPlayer[playerId] = nextEpoch;
-    myConnectionEpoch = nextEpoch;
+
+    if (socket === ws) {
+      myPlayerId = playerId;
+      myRole = session.hostPlayerId === playerId ? "HOST" : "PLAYER";
+      myConnectionEpoch = nextEpoch;
+    }
   };
 
   const bindSocketAsUnclaimed = (
@@ -961,16 +734,24 @@ wss.on("connection", (ws) => {
     const startedAt = performance.now();
     const rawMessage = raw.toString();
     const payloadBytes = Buffer.byteLength(rawMessage, "utf8");
-    if (Buffer.byteLength(rawMessage, "utf8") > MAX_WS_MESSAGE_BYTES) {
-      sendError(ws, "Payload too large.", {
-        sessionId: currentSessionId ?? undefined,
-        playerId: myPlayerId,
-      });
+    metrics.observe("ws_payload_bytes", payloadBytes);
+
+    if (payloadBytes > MAX_WS_MESSAGE_BYTES) {
+      sendError(
+        ws,
+        "Payload too large.",
+        {
+          sessionId: currentSessionId ?? undefined,
+          playerId: myPlayerId,
+        },
+        { code: SERVER_ERROR_CODES.VALIDATION },
+      );
       ws.close(1009, "Payload too large");
       return;
     }
 
     if (!rateLimiter.consume(1, receivedAt)) {
+      metrics.increment("ws_rejected_total", 1, { reason: "rate_limit" });
       sendError(ws, "Rate limit exceeded.", {
         sessionId: currentSessionId ?? undefined,
         playerId: myPlayerId,
@@ -979,24 +760,55 @@ wss.on("connection", (ws) => {
     }
 
     try {
-      const parsed: unknown = JSON.parse(rawMessage);
-      const parsedMessage = parseClientMessage(parsed);
+      const parsedRaw: unknown = JSON.parse(rawMessage);
+      const envelopeRequestId = extractRequestIdFromRaw(parsedRaw);
+      const protocolVersion = extractProtocolVersion(parsedRaw);
+      if (
+        protocolVersion !== undefined &&
+        (protocolVersion < MIN_SUPPORTED_PROTOCOL_VERSION ||
+          protocolVersion > MAX_SUPPORTED_PROTOCOL_VERSION)
+      ) {
+        sendError(
+          ws,
+          `Unsupported protocol version ${protocolVersion}.`,
+          {
+            sessionId: currentSessionId ?? undefined,
+            playerId: myPlayerId,
+            requestId: envelopeRequestId,
+          },
+          { code: SERVER_ERROR_CODES.UNSUPPORTED_PROTOCOL },
+        );
+        return;
+      }
+
+      const parsedMessage = parseClientMessage(parsedRaw);
       if (!parsedMessage.ok) {
-        sendError(ws, parsedMessage.error, {
-          sessionId: currentSessionId ?? undefined,
-          playerId: myPlayerId,
-        });
+        metrics.increment("ws_rejected_total", 1, { reason: "schema" });
+        sendError(
+          ws,
+          parsedMessage.error,
+          {
+            sessionId: currentSessionId ?? undefined,
+            playerId: myPlayerId,
+            requestId: envelopeRequestId,
+          },
+          { code: SERVER_ERROR_CODES.VALIDATION },
+        );
         return;
       }
 
       const data = parsedMessage.data;
+      const requestId = extractRequestId(data);
       const latencyMs = Math.round((performance.now() - startedAt) * 100) / 100;
+      metrics.observe("ws_message_latency_ms", latencyMs, { type: data.type });
+      metrics.increment("ws_messages_total", 1, { type: data.type });
       logEvent("debug", "ws.message_received", {
         sessionId: currentSessionId ?? undefined,
         playerId: myPlayerId ?? undefined,
         messageType: data.type,
         payloadBytes,
         latencyMs,
+        requestId,
       });
 
       const session = currentSessionId ? sessions[currentSessionId] : null;
@@ -1007,6 +819,11 @@ wss.on("connection", (ws) => {
         data.messageId &&
         hasProcessedMessage(session, data.messageId)
       ) {
+        sendAck(ws, {
+          requestId,
+          messageType: data.type,
+          stateVersion: session.stateVersion,
+        });
         sendCurrentStateToSocket();
         return;
       }
@@ -1025,7 +842,9 @@ wss.on("connection", (ws) => {
             sessionId: currentSessionId ?? undefined,
             playerId: myPlayerId,
             messageType: data.type,
+            requestId,
           },
+          { code: SERVER_ERROR_CODES.STALE_STATE },
         );
         sendCurrentStateToSocket();
         return;
@@ -1061,6 +880,7 @@ wss.on("connection", (ws) => {
             pendingJoinNonces: new Map([
               [joinNonce, Date.now() + PENDING_JOIN_NONCE_TTL_MS],
             ]),
+            pendingSeatTransfers: new Map(),
             validReconnectVersions: {},
             connectionEpochByPlayer: {},
           };
@@ -1076,6 +896,12 @@ wss.on("connection", (ws) => {
             gameType,
             inviteToken,
             sessionToken,
+            requestId,
+          });
+          sendAck(ws, {
+            requestId,
+            messageType: data.type,
+            stateVersion: createdSession.stateVersion,
           });
           transitionSessionLifecycle(
             sessionId,
@@ -1089,7 +915,6 @@ wss.on("connection", (ws) => {
 
         case "JOIN_SESSION": {
           const sid = data.sessionId.toUpperCase();
-
           if (!sessions[sid]) {
             const persisted = db.recoverSession(sid);
             if (persisted) {
@@ -1097,18 +922,23 @@ wss.on("connection", (ws) => {
               sessions[sid].lifecycleReason = "session-restored-on-demand";
               ensureValidHost(sessions[sid]);
             } else {
-              sendError(ws, "Session not found.", {
-                sessionId: sid,
-                playerId: myPlayerId,
-                messageType: data.type,
-              });
+              sendError(
+                ws,
+                "Session not found.",
+                {
+                  sessionId: sid,
+                  playerId: myPlayerId,
+                  messageType: data.type,
+                  requestId,
+                },
+                { code: SERVER_ERROR_CODES.NOT_FOUND },
+              );
               break;
             }
           }
 
           const targetSession = sessions[sid];
           sessionOrchestrator.cancelCleanup(sid);
-
           pruneSessionCaches(targetSession);
           currentSessionId = sid;
 
@@ -1121,29 +951,42 @@ wss.on("connection", (ws) => {
                 playerId: myPlayerId,
                 messageType: data.type,
                 reconnectTraceId,
+                requestId,
               });
               break;
             }
             if (verified.claims.sid !== sid) {
-              sendError(ws, "Reconnect token does not match this session.", {
-                sessionId: sid,
-                playerId: verified.claims.pid,
-                messageType: data.type,
-                reconnectTraceId,
-              });
+              sendError(
+                ws,
+                "Reconnect token does not match this session.",
+                {
+                  sessionId: sid,
+                  playerId: verified.claims.pid,
+                  messageType: data.type,
+                  reconnectTraceId,
+                  requestId,
+                },
+                { code: SERVER_ERROR_CODES.AUTHENTICATION },
+              );
               break;
             }
 
             const reconnectingPlayer = targetSession.state.players.find(
-              (p: any) => p.id === verified.claims.pid,
+              (p) => p.id === verified.claims.pid,
             );
             if (!reconnectingPlayer) {
-              sendError(ws, "Reconnect token refers to a missing player.", {
-                sessionId: sid,
-                playerId: verified.claims.pid,
-                messageType: data.type,
-                reconnectTraceId,
-              });
+              sendError(
+                ws,
+                "Reconnect token refers to a missing player.",
+                {
+                  sessionId: sid,
+                  playerId: verified.claims.pid,
+                  messageType: data.type,
+                  reconnectTraceId,
+                  requestId,
+                },
+                { code: SERVER_ERROR_CODES.NOT_FOUND },
+              );
               break;
             }
 
@@ -1153,12 +996,18 @@ wss.on("connection", (ws) => {
               knownVersion !== undefined &&
               knownVersion !== verified.claims.reconnectVersion
             ) {
-              sendError(ws, "Stale reconnect token.", {
-                sessionId: sid,
-                playerId: verified.claims.pid,
-                messageType: data.type,
-                reconnectTraceId,
-              });
+              sendError(
+                ws,
+                "Stale reconnect token.",
+                {
+                  sessionId: sid,
+                  playerId: verified.claims.pid,
+                  messageType: data.type,
+                  reconnectTraceId,
+                  requestId,
+                },
+                { code: SERVER_ERROR_CODES.STALE_STATE },
+              );
               break;
             }
 
@@ -1172,6 +1021,7 @@ wss.on("connection", (ws) => {
               targetSession,
               "player-reconnected",
             );
+            metrics.increment("reconnect_success_total");
             logEvent("info", "session.reconnect_resumed", {
               sessionId: sid,
               playerId: verified.claims.pid,
@@ -1195,17 +1045,29 @@ wss.on("connection", (ws) => {
               resumed: true,
               role: myRole,
               reconnectToken,
+              requestId,
+            });
+            sendAck(ws, {
+              requestId,
+              messageType: data.type,
+              stateVersion: targetSession.stateVersion,
             });
             broadcastState(sid);
             break;
           }
 
           if (!data.inviteToken) {
-            sendError(ws, "inviteToken is required for new session joins.", {
-              sessionId: sid,
-              playerId: myPlayerId,
-              messageType: data.type,
-            });
+            sendError(
+              ws,
+              "inviteToken is required for new session joins.",
+              {
+                sessionId: sid,
+                playerId: myPlayerId,
+                messageType: data.type,
+                requestId,
+              },
+              { code: SERVER_ERROR_CODES.AUTHENTICATION },
+            );
             break;
           }
           const inviteCheck = verifyToken(data.inviteToken, "invite");
@@ -1214,23 +1076,38 @@ wss.on("connection", (ws) => {
               sessionId: sid,
               playerId: myPlayerId,
               messageType: data.type,
+              requestId,
             });
             break;
           }
           if (inviteCheck.claims.sid !== sid) {
-            sendError(ws, "Invite token does not match this session.", {
-              sessionId: sid,
-              playerId: myPlayerId,
-              messageType: data.type,
-            });
+            sendError(
+              ws,
+              "Invite token does not match this session.",
+              {
+                sessionId: sid,
+                playerId: myPlayerId,
+                messageType: data.type,
+                requestId,
+              },
+              { code: SERVER_ERROR_CODES.AUTHENTICATION },
+            );
             break;
           }
 
-          const requestedRole = data.joinAs === "SPECTATOR" ? "SPECTATOR" : "PLAYER";
+          const requestedRole =
+            data.joinAs === "SPECTATOR" ? "SPECTATOR" : "PLAYER";
           if (requestedRole === "PLAYER" && targetSession.state.phase !== "LOBBY") {
             sendError(
               ws,
               "Game already in progress. Use a reconnect token to reclaim your seat.",
+              {
+                sessionId: sid,
+                playerId: myPlayerId,
+                messageType: data.type,
+                requestId,
+              },
+              { code: SERVER_ERROR_CODES.SESSION_STATE },
             );
             break;
           }
@@ -1262,6 +1139,12 @@ wss.on("connection", (ws) => {
             resumed: false,
             role: requestedRole,
             sessionToken,
+            requestId,
+          });
+          sendAck(ws, {
+            requestId,
+            messageType: data.type,
+            stateVersion: targetSession.stateVersion,
           });
           sendCurrentStateToSocket();
           break;
@@ -1269,58 +1152,99 @@ wss.on("connection", (ws) => {
 
         case "JOIN_LOBBY": {
           if (!session || !currentSessionId) {
-            sendError(ws, "Join a session first.");
+            sendError(ws, "Join a session first.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
           if (myPlayerId) {
-            sendError(ws, "Already joined as a player.");
+            sendError(ws, "Already joined as a player.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
 
           const tokenCheck = verifyToken(data.sessionToken, "session");
           if (!tokenCheck.ok) {
-            sendError(ws, tokenCheck.error);
+            sendError(ws, tokenCheck.error, { requestId, messageType: data.type });
             break;
           }
           if (tokenCheck.claims.sid !== currentSessionId) {
-            sendError(ws, "Session token does not match this session.");
+            sendError(
+              ws,
+              "Session token does not match this session.",
+              {
+                requestId,
+                messageType: data.type,
+              },
+              { code: SERVER_ERROR_CODES.AUTHENTICATION },
+            );
             break;
           }
           if (tokenCheck.claims.role !== "PLAYER") {
-            sendError(ws, "Spectators cannot join the lobby as players.");
+            sendError(
+              ws,
+              "Spectators cannot join the lobby as players.",
+              {
+                requestId,
+                messageType: data.type,
+              },
+              { code: SERVER_ERROR_CODES.AUTHORIZATION },
+            );
             break;
           }
           const nonceExpiry = session.pendingJoinNonces.get(
             tokenCheck.claims.joinNonce,
           );
           if (!nonceExpiry || nonceExpiry <= Date.now()) {
-            sendError(ws, "Session token has already been used or expired.");
+            sendError(
+              ws,
+              "Session token has already been used or expired.",
+              {
+                requestId,
+                messageType: data.type,
+              },
+              { code: SERVER_ERROR_CODES.AUTHENTICATION },
+            );
             break;
           }
           session.pendingJoinNonces.delete(tokenCheck.claims.joinNonce);
 
           if (session.state.phase !== "LOBBY") {
-            sendError(ws, "Game already in progress.");
+            sendError(ws, "Game already in progress.", {
+              requestId,
+              messageType: data.type,
+              sessionId: currentSessionId,
+            });
             break;
           }
 
           const maxPlayers = MAX_PLAYERS[session.gameType] || 10;
           if (session.state.players.length >= maxPlayers) {
-            sendError(ws, `Lobby is full (${maxPlayers} players max).`);
+            sendError(ws, `Lobby is full (${maxPlayers} players max).`, {
+              requestId,
+              messageType: data.type,
+              sessionId: currentSessionId,
+            });
             break;
           }
 
           const trimmedName = data.player.name.trim();
           const nameLower = trimmedName.toLowerCase();
           if (
-            session.state.players.some((p: any) => p.name.toLowerCase() === nameLower)
+            session.state.players.some((p) => p.name.toLowerCase() === nameLower)
           ) {
-            sendError(ws, "That name is already taken.");
+            sendError(ws, "That name is already taken.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
 
           let playerId = generatePlayerId();
-          while (session.state.players.some((p: any) => p.id === playerId)) {
+          while (session.state.players.some((p) => p.id === playerId)) {
             playerId = generatePlayerId();
           }
 
@@ -1356,7 +1280,63 @@ wss.on("connection", (ws) => {
             session,
             "player-joined-lobby",
           );
+          sendAck(ws, {
+            requestId,
+            messageType: data.type,
+            stateVersion: session.stateVersion,
+          });
           broadcastState(currentSessionId);
+          break;
+        }
+
+        case "REQUEST_SEAT_TRANSFER": {
+          if (!session || !currentSessionId) {
+            sendError(ws, "Join a session first.", {
+              requestId,
+              messageType: data.type,
+            });
+            break;
+          }
+          if (myRole !== "SPECTATOR" || myPlayerId) {
+            sendError(
+              ws,
+              "Only spectators can request seat transfer.",
+              { requestId, messageType: data.type },
+              { code: SERVER_ERROR_CODES.AUTHORIZATION },
+            );
+            break;
+          }
+          const transferToken = crypto.randomBytes(24).toString("hex");
+          const requestedAtEpochMs = Date.now();
+          const expiresAt = requestedAtEpochMs + SEAT_TRANSFER_TOKEN_TTL_MS;
+          const requestedBy = data.displayName?.trim() || "Spectator";
+          session.pendingSeatTransfers.set(transferToken, {
+            ws,
+            requestedBy,
+            requestedAtEpochMs,
+            expiresAt,
+          });
+
+          const event = {
+            type: "SEAT_TRANSFER_REQUEST" as const,
+            transferToken,
+            requestedBy,
+            requestedAtEpochMs,
+            expiresAtEpochMs: expiresAt,
+            requestId,
+          };
+
+          for (const [clientWs, pid] of session.clients.entries()) {
+            if (pid === session.hostPlayerId && clientWs.readyState === WebSocket.OPEN) {
+              sendServerEvent(clientWs, event);
+            }
+          }
+          sendServerEvent(ws, event);
+          sendAck(ws, {
+            requestId,
+            messageType: data.type,
+            stateVersion: session.stateVersion,
+          });
           break;
         }
 
@@ -1372,83 +1352,78 @@ wss.on("connection", (ws) => {
         case "MOVE_CARD":
         case "GAME_ACTION": {
           if (!session || !currentSessionId) {
-            sendError(ws, "Join a session first.");
+            sendError(ws, "Join a session first.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
           if (!myPlayerId || (myRole !== "HOST" && myRole !== "PLAYER")) {
-            sendError(ws, "Join the lobby before sending actions.");
+            sendError(ws, "Join the lobby before sending actions.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
           const latestEpoch = session.connectionEpochByPlayer[myPlayerId] ?? 0;
           if (myConnectionEpoch !== latestEpoch) {
-            sendError(ws, "Stale connection. Reconnect and try again.");
+            sendError(ws, "Stale connection. Reconnect and try again.", {
+              requestId,
+              messageType: data.type,
+            });
             sendCurrentStateToSocket();
             break;
           }
 
           const dispatch = (
             actionData: Record<string, unknown>,
-            shouldSendError: boolean = false,
+            shouldSendActionError = false,
           ) => {
             const liveSession = currentSessionId
               ? sessions[currentSessionId]
               : null;
-            if (!liveSession) return;
-            let result: { state?: GameStateUnion; error?: string } = {};
-
-            if (liveSession.gameType === "LITERATURE") {
-              result = LiteratureHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-              );
-            } else if (liveSession.gameType === "COUP") {
-              result = CoupHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-                broadcastState,
-                dispatch,
-              );
-            } else if (liveSession.gameType === "SECRET_HITLER") {
-              result = SecretHitlerHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-              );
-            } else if (liveSession.gameType === "HANABI") {
-              result = HanabiHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-              );
-            } else if (liveSession.gameType === "LOVE_LETTER") {
-              result = LoveLetterHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-              );
-            } else if (liveSession.gameType === "SPADES") {
-              result = SpadesHandler.handleAction(
-                liveSession.state as any,
-                actionData,
-              );
+            if (!liveSession || !currentSessionId) {
+              return;
             }
+            const result = dispatchGameAction(
+              liveSession.gameType,
+              liveSession.state,
+              actionData,
+              { broadcastState, dispatch },
+            );
 
-            if (result.error && shouldSendError) {
-              sendError(ws, result.error);
+            if (result.error && shouldSendActionError) {
+              sendError(ws, result.error, {
+                sessionId: currentSessionId,
+                playerId: myPlayerId,
+                messageType: data.type,
+                requestId,
+              });
             } else if (result.state) {
               liveSession.state = capMoveLog(result.state);
               liveSession.lastActionTimestamp = Date.now();
               liveSession.stateVersion += 1;
               ensureValidHost(liveSession);
               ensureLifecycleForCurrentState(
-                currentSessionId!,
+                currentSessionId,
                 liveSession,
                 "game-action",
               );
-              broadcastState(currentSessionId!);
+              sendAck(ws, {
+                requestId,
+                messageType: data.type,
+                stateVersion: liveSession.stateVersion,
+              });
+              broadcastState(currentSessionId);
             }
           };
 
           if (data.type === "START_GAME") {
             if (myRole !== "HOST" || myPlayerId !== session.hostPlayerId) {
-              sendError(ws, "Only the host can start the game.");
+              sendError(ws, "Only the host can start the game.", {
+                requestId,
+                messageType: data.type,
+              });
               break;
             }
           }
@@ -1459,11 +1434,17 @@ wss.on("connection", (ws) => {
 
         case "HOST_ACTION": {
           if (!session || !currentSessionId) {
-            sendError(ws, "Join a session first.");
+            sendError(ws, "Join a session first.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
           if (myRole !== "HOST" || myPlayerId !== session.hostPlayerId) {
-            sendError(ws, "Only the host can perform administrative actions.");
+            sendError(ws, "Only the host can perform administrative actions.", {
+              requestId,
+              messageType: data.type,
+            });
             break;
           }
 
@@ -1480,29 +1461,43 @@ wss.on("connection", (ws) => {
               sendError(clientWs, "The host has ended the game.");
               clientWs.close(1000, "Game ended by host");
             }
+            sendAck(ws, {
+              requestId,
+              messageType: data.type,
+              stateVersion: session.stateVersion,
+            });
             delete sessions[currentSessionId];
             sessionOrchestrator.clearSession(currentSessionId);
           } else if (action === "KICK_PLAYER") {
             if (!data.targetId) {
-              sendError(ws, "Invalid targetId.");
+              sendError(ws, "Invalid targetId.", {
+                requestId,
+                messageType: data.type,
+              });
               break;
             }
             const targetId = data.targetId;
             if (targetId === myPlayerId) {
-              sendError(ws, "Host cannot kick themselves.");
+              sendError(ws, "Host cannot kick themselves.", {
+                requestId,
+                messageType: data.type,
+              });
               break;
             }
 
             const removedIndex = session.state.players.findIndex(
-              (p: any) => p.id === targetId,
+              (p) => p.id === targetId,
             );
             if (removedIndex === -1) {
-              sendError(ws, "Player not found.");
+              sendError(ws, "Player not found.", {
+                requestId,
+                messageType: data.type,
+              });
               break;
             }
 
             const nextPlayers = session.state.players.filter(
-              (p: any) => p.id !== targetId,
+              (p) => p.id !== targetId,
             );
             let nextActivePlayerIndex = session.state.activePlayerIndex;
             if (nextPlayers.length === 0) {
@@ -1519,7 +1514,6 @@ wss.on("connection", (ws) => {
               activePlayerIndex: Math.max(nextActivePlayerIndex, 0),
             };
 
-            // Disconnect the kicked player
             for (const [clientWs, pid] of session.clients.entries()) {
               if (pid === targetId) {
                 sendError(clientWs, "You have been kicked by the host.");
@@ -1542,6 +1536,11 @@ wss.on("connection", (ws) => {
               "host-kick-player",
             );
             session.lastActionTimestamp = Date.now();
+            sendAck(ws, {
+              requestId,
+              messageType: data.type,
+              stateVersion: session.stateVersion,
+            });
             broadcastState(currentSessionId);
           } else if (action === "FORCE_SKIP") {
             if (
@@ -1564,21 +1563,132 @@ wss.on("connection", (ws) => {
                 "host-force-skip",
               );
               session.lastActionTimestamp = Date.now();
+              sendAck(ws, {
+                requestId,
+                messageType: data.type,
+                stateVersion: session.stateVersion,
+              });
               broadcastState(currentSessionId);
             }
           } else if (action === "REASSIGN_SEAT") {
-            sendError(
-              ws,
-              "Seat reassignment is disabled because it can corrupt game state. Ask the player to reconnect with their original ID.",
+            if (!data.targetId || !data.transferToken) {
+              sendError(
+                ws,
+                "REASSIGN_SEAT requires targetId and transferToken.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.VALIDATION },
+              );
+              break;
+            }
+            const transferRequest = session.pendingSeatTransfers.get(
+              data.transferToken,
             );
+            if (!transferRequest || transferRequest.expiresAt <= Date.now()) {
+              sendError(
+                ws,
+                "Seat transfer token has expired or is invalid.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.NOT_FOUND },
+              );
+              break;
+            }
+            if (session.clients.get(transferRequest.ws) !== "") {
+              sendError(
+                ws,
+                "Seat transfer token is already claimed.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.CONFLICT },
+              );
+              break;
+            }
+            const targetPlayer = session.state.players.find(
+              (p) => p.id === data.targetId,
+            );
+            if (!targetPlayer) {
+              sendError(
+                ws,
+                "Target player was not found.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.NOT_FOUND },
+              );
+              break;
+            }
+            if (targetPlayer.isConnected !== false) {
+              sendError(
+                ws,
+                "Seat can only be reassigned when the target player is disconnected.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.CONFLICT },
+              );
+              break;
+            }
+            const targetHasOpenSocket = Array.from(session.clients.entries()).some(
+              ([clientWs, pid]) =>
+                pid === data.targetId && clientWs.readyState === WebSocket.OPEN,
+            );
+            if (targetHasOpenSocket) {
+              sendError(
+                ws,
+                "Target player already has an active connection.",
+                { requestId, messageType: data.type },
+                { code: SERVER_ERROR_CODES.CONFLICT },
+              );
+              break;
+            }
+
+            session.pendingSeatTransfers.delete(data.transferToken);
+            const nextReconnectVersion =
+              (session.validReconnectVersions[data.targetId] ?? 1) + 1;
+            session.validReconnectVersions[data.targetId] = nextReconnectVersion;
+            const targetRole: SessionRole =
+              data.targetId === session.hostPlayerId ? "HOST" : "PLAYER";
+            const reconnectToken = issueReconnectToken(
+              currentSessionId,
+              data.targetId,
+              targetRole,
+              nextReconnectVersion,
+            );
+            db.recordSeatTransferAudit(
+              currentSessionId,
+              data.transferToken,
+              data.targetId,
+            );
+            sendServerEvent(transferRequest.ws, {
+              type: "SEAT_TRANSFER_GRANTED",
+              sessionId: currentSessionId,
+              targetPlayerId: data.targetId,
+              transferToken: data.transferToken,
+              reconnectToken,
+            });
+            session.state = prependServerMove(
+              session.state,
+              createServerMove(
+                `Host authorized seat transfer for player ${data.targetId}.`,
+                "Host",
+              ),
+            );
+            session.stateVersion += 1;
+            session.lastActionTimestamp = Date.now();
+            sendAck(ws, {
+              requestId,
+              messageType: data.type,
+              stateVersion: session.stateVersion,
+            });
+            broadcastState(currentSessionId);
           } else {
-            sendError(ws, `Unsupported host action: ${action}`);
+            sendError(ws, `Unsupported host action: ${action}`, {
+              requestId,
+              messageType: data.type,
+            });
           }
           break;
         }
       }
     } catch (error) {
       const isSyntaxError = error instanceof SyntaxError;
+      metrics.increment("ws_rejected_total", 1, {
+        reason: isSyntaxError ? "invalid_json" : "internal",
+      });
       sendError(
         ws,
         isSyntaxError ? "Invalid JSON payload." : "Message processing failed.",
@@ -1586,17 +1696,27 @@ wss.on("connection", (ws) => {
           sessionId: currentSessionId ?? undefined,
           playerId: myPlayerId,
         },
+        {
+          code: isSyntaxError
+            ? SERVER_ERROR_CODES.VALIDATION
+            : SERVER_ERROR_CODES.INTERNAL,
+        },
       );
     }
   });
 
   ws.on("close", () => {
+    metrics.increment("ws_disconnections_total");
     if (currentSessionId && sessions[currentSessionId]) {
       const session = sessions[currentSessionId];
       const disconnectedPlayerId = session.clients.get(ws) || null;
       session.clients.delete(ws);
+      for (const [token, transfer] of session.pendingSeatTransfers.entries()) {
+        if (transfer.ws === ws) {
+          session.pendingSeatTransfers.delete(token);
+        }
+      }
 
-      // Mark player as disconnected (if not connected via another socket)
       if (
         disconnectedPlayerId &&
         !isPlayerConnectedViaAnotherSocket(session, disconnectedPlayerId, ws)
@@ -1612,10 +1732,8 @@ wss.on("connection", (ws) => {
         });
       }
 
-      // Prune any other dead clients
       pruneDeadClients(session);
 
-      // Schedule cleanup if no one is left
       if (session.clients.size === 0) {
         transitionSessionLifecycle(
           currentSessionId,
@@ -1672,8 +1790,51 @@ function shutdownGracefully(signal: string) {
 process.on("SIGINT", () => shutdownGracefully("SIGINT"));
 process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
 
+function getOperationalSnapshot() {
+  const persistence = db.getPersistenceHealth();
+  const orchestrator = sessionOrchestrator.getDiagnostics();
+  return {
+    timestamp: new Date().toISOString(),
+    sessionsLoaded: Object.keys(sessions).length,
+    persistence,
+    orchestrator,
+  };
+}
+
 app.get("/ping", (_req, res) => {
   res.send("pong");
+});
+app.get("/health", (_req, res) => {
+  const snapshot = getOperationalSnapshot();
+  const ok = snapshot.persistence.ok;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    ...snapshot,
+  });
+});
+app.get("/ready", (_req, res) => {
+  const snapshot = getOperationalSnapshot();
+  const ready = isServerListening && snapshot.persistence.ok && snapshot.orchestrator.running;
+  res.status(ready ? 200 : 503).json({
+    ready,
+    listening: isServerListening,
+    sessionsLoaded: snapshot.sessionsLoaded,
+    orchestrator: snapshot.orchestrator,
+    persistence: {
+      ok: snapshot.persistence.ok,
+      latestMigrationId: snapshot.persistence.latestMigrationId,
+      appliedMigrationIds: snapshot.persistence.appliedMigrationIds,
+    },
+  });
+});
+app.get("/metrics", (_req, res) => {
+  res.json({
+    protocol: {
+      minSupported: MIN_SUPPORTED_PROTOCOL_VERSION,
+      maxSupported: MAX_SUPPORTED_PROTOCOL_VERSION,
+    },
+    metrics: metrics.snapshot(),
+  });
 });
 app.use(express.static(path.join(__dirname, "../dist")));
 app.get("/*splat", (_req, res) => {
@@ -1701,6 +1862,7 @@ export function startServer(port: number = Number(PORT)): Promise<number> {
       server.off("error", reject);
       isServerListening = true;
       const actualPort = getBoundPort() ?? port;
+      metrics.increment("server_start_total");
       logEvent("info", "server.started", { detail: String(actualPort) });
       resolve(actualPort);
     });
@@ -1718,6 +1880,7 @@ export function stopServer(): Promise<void> {
     sessionOrchestrator.stop();
     server.close(() => {
       isServerListening = false;
+      metrics.increment("server_stop_total");
       logEvent("info", "server.stopped");
       resolve();
     });

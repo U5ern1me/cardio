@@ -4,6 +4,18 @@ Deep-dive on the server internals, WebSocket protocol, and shared systems. Read 
 
 ---
 
+## Server Architecture (Phase 3)
+
+Core runtime remains in `server/index.ts`, but responsibilities are now split into explicit modules:
+
+- `server/protocol/schemas.ts` — strict runtime schemas for all client/server wire messages
+- `server/protocol/respond.ts` — protocol envelope emission (`ACK`, `REJECT`, legacy `ERROR`)
+- `server/state/gameState.ts` — game-state initialization + privacy sanitization
+- `server/games/dispatcher.ts` — game handler dispatch boundary
+- `server/sessionOrchestrator.ts` — lifecycle timers (disconnect grace, inactivity, cleanup)
+- `server/db.ts` + `server/persistence/*` — append-only persistence, replay/recovery, migration tooling
+- `server/infra/logger.ts` + `server/infra/metrics.ts` — structured logs + in-memory metrics snapshot
+
 ## Server: `server/index.ts`
 
 ### Session Object
@@ -17,6 +29,7 @@ interface Session {
   stateVersion: number;
   lifecycleState: "LOBBY" | "ACTIVE" | "COMPLETED" | "IDLE_EMPTY" | "ENDED";
   inviteToken: string;
+  pendingSeatTransfers: Map<string, SeatTransferRequest>;
   validReconnectVersions: Record<string, number>;
   connectionEpochByPlayer: Record<string, number>;
 }
@@ -54,15 +67,17 @@ LITERATURE: 8 | COUP: 6 | SECRET_HITLER: 10 | HANABI: 5 | LOVE_LETTER: 4 | SPADE
 
 | Type                   | Payload                                   | Notes                                                                      |
 | ---------------------- | ----------------------------------------- | -------------------------------------------------------------------------- |
-| `CREATE_SESSION`       | `{gameType, messageId?}`                  | Server responds with `SESSION_CREATED` (includes invite + one-time session token) |
-| `JOIN_SESSION`         | `{sessionId, inviteToken? or reconnectToken?, joinAs?, messageId?}` | Invite-only join authorization and reconnect resume                         |
-| `JOIN_LOBBY`           | `{sessionToken, player: {name, team?, seatIndex?}, messageId}` | Claims a lobby seat with server-issued one-time token                      |
+| `CREATE_SESSION`       | `{protocolVersion?, requestId?, gameType, messageId?}`                  | Server responds with `SESSION_CREATED` (includes invite + one-time session token) |
+| `JOIN_SESSION`         | `{protocolVersion?, requestId?, sessionId, inviteToken? or reconnectToken?, joinAs?, messageId?}` | Invite-only join authorization and reconnect resume                         |
+| `JOIN_LOBBY`           | `{protocolVersion?, requestId?, sessionToken, player: {name, team?, seatIndex?}, messageId}` | Claims a lobby seat with server-issued one-time token                      |
 | `START_GAME`           | `{}`                                      | Host only; delegates to game handler                                       |
 | `ASK_CARD`             | `{askerId, targetId, card}`               | Literature only (server trusts socket-bound actor identity, not askerId)   |
 | `CLAIM_BOOK`           | `{claimerId, halfSuit}`                   | Literature only (server trusts socket-bound actor identity, not claimerId) |
 | `COUP_ACTION`          | varies                                    | Coup-specific                                                              |
 | `SECRET_HITLER_ACTION` | varies                                    | Secret Hitler-specific                                                     |
 | `GAME_ACTION`          | `{actorId, ...}`                          | Generic action for all games                                               |
+| `REQUEST_SEAT_TRANSFER`| `{protocolVersion?, requestId?, displayName?, messageId}`              | Spectator requests host-approved disconnected-seat takeover token           |
+| `HOST_ACTION.REASSIGN_SEAT` | `{targetId, transferToken}`         | Host-only deterministic ownership transfer                                 |
 
 ### Server → Client
 
@@ -71,15 +86,27 @@ LITERATURE: 8 | COUP: 6 | SECRET_HITLER: 10 | HANABI: 5 | LOVE_LETTER: 4 | SPADE
 | `SESSION_CREATED` | `{sessionId, gameType, inviteToken, sessionToken}`           |
 | `SESSION_JOINED`  | `{sessionId, gameType, resumed, role, stateVersion, lifecycleState, sessionToken?/reconnectToken?}` |
 | `STATE_UPDATE`    | `{state (sanitized + hostPlayerId), yourPlayerId, gameType, stateVersion, lifecycleState, reconnectToken?, capabilities}` |
+| `ACK`             | `{requestId, ackType, messageType, stateVersion?}`           |
+| `REJECT`          | `{requestId, code, message, retryable}`                      |
+| `SEAT_TRANSFER_REQUEST` | `{transferToken, requestedBy, requestedAtEpochMs, expiresAtEpochMs}` |
+| `SEAT_TRANSFER_GRANTED` | `{sessionId, targetPlayerId, transferToken, reconnectToken}` |
 | `ERROR`           | `{message}`                                                  |
 
 `actorId: myPlayerId` is injected by `server/index.ts` before dispatching to every handler.
+
+### Versioning + Compatibility
+
+- Shared contracts live in `src/shared/protocolContracts.ts`
+- Current protocol version: `1`
+- Supported range is explicitly bounded by `MIN_SUPPORTED_PROTOCOL_VERSION` and `MAX_SUPPORTED_PROTOCOL_VERSION`
+- Unsupported versions are rejected with typed `REJECT { code: "UNSUPPORTED_PROTOCOL" }`
+- Legacy compatibility is preserved by still emitting `ERROR` alongside typed `REJECT`
 
 ---
 
 ## State Sanitization
 
-`sanitizeStateForPlayer(state, playerId)` in `server/index.ts` runs before every `STATE_UPDATE` send.
+`sanitizeStateForPlayer(state, playerId)` in `server/state/gameState.ts` runs before every `STATE_UPDATE` send.
 
 | Game          | What is hidden                                                                                                                                                                                                              |
 | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -115,7 +142,7 @@ export function handleAction(
 
 ## `createEmptyState` Defaults
 
-`server/index.ts` initializes a blank state for each game type. The base shape for all games:
+`server/state/gameState.ts` initializes a blank state for each game type. The base shape for all games:
 
 ```typescript
 {
@@ -223,6 +250,25 @@ interface BaseGameState {
 
 ---
 
+## Persistence + Migrations
+
+- SQLite remains the persistence engine (single-node, self-hosted optimized)
+- Append-only events + snapshots are replayed through `recoverSession()` / `replaySessionFromEvents()`
+- Schema migrations are now first-class:
+  - `server/persistence/migrations.ts`
+  - `server/persistence/migrationDefinitions.ts`
+- Migration state is exposed by persistence health diagnostics
+- Seat transfers are audit-recorded in `seat_transfer_audit`
+
+## Observability + Operational Interfaces
+
+- Structured JSON logs: `server/infra/logger.ts`
+- Metrics abstraction: `server/infra/metrics.ts`
+- HTTP operational endpoints:
+  - `GET /health` — persistence + orchestrator status snapshot
+  - `GET /ready` — readiness gate (`listening && persistence ok && orchestrator running`)
+  - `GET /metrics` — protocol range + in-memory metrics counters/histograms
+
 ## Testing
 
 Tests live co-located with the modules they test:
@@ -230,8 +276,12 @@ Tests live co-located with the modules they test:
 - `src/games/*/logic.test.ts` — Pure game logic unit tests (e.g., Literature: 47, Coup: 11, Secret Hitler: 12)
 - `server/games/*.test.ts` — Server handler integration tests (e.g., Literature: 12, Secret Hitler: 8)
 - `server/index.test.ts` — Server core logic (Sanitization)
+- `server/protocol/schemas.test.ts` — Protocol envelope and typed reject schema tests
+- `server/persistence/migrations.test.ts` — Migration idempotency and table creation tests
+- `server/operational.test.ts` — `/health`, `/ready`, `/metrics` operational endpoint tests
+- `server/testUtils/*` — shared websocket harness + chaos helpers used by multiplayer integration tests
 
-There are 140+ tests across the codebase, including multiplayer chaos/recovery integration tests for malformed payloads, reconnect storms, stale token rejection, host migration, and snapshot replay recovery.
+There are 140+ tests across the codebase, including multiplayer chaos/recovery integration tests for malformed payloads, reconnect storms, stale token rejection, host migration, snapshot replay recovery, protocol-version rejection, and deterministic seat transfer reclaim.
 
 Target pure functions in `logic.ts` for unit tests. Handler tests should verify validation, happy path, and edge cases (turn enforcement, missing fields, game-over).
 

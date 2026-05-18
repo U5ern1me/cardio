@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { useGame } from "../context/GameContext";
+import { useGame } from "../context/GameContextStore";
 
 export default function HostControls() {
   const { gameState, myPlayerId, sendMessage } = useGame();
   const [isOpen, setIsOpen] = useState(false);
+  const [seatTransferToken, setSeatTransferToken] = useState("");
 
   if (!gameState || !myPlayerId) return null;
   const hostId = gameState.hostPlayerId;
@@ -53,11 +54,52 @@ export default function HostControls() {
               <span className="text-[10px] text-on-surface-variant uppercase tracking-widest block mb-2 font-bold">
                 Transfer Seat
               </span>
-              <p className="text-[11px] text-on-surface-variant leading-relaxed">
-                Seat transfer is temporarily disabled to prevent state
-                corruption. Ask disconnected players to reconnect with their
-                original player ID.
+              <p className="text-[11px] text-on-surface-variant leading-relaxed mb-2">
+                Spectators request a seat transfer token, then host approves
+                the disconnected seat reclaim here.
               </p>
+              <input
+                value={seatTransferToken}
+                onChange={(event) => setSeatTransferToken(event.target.value)}
+                className="text-xs w-full bg-surface mb-2 p-2 rounded border border-outline-variant outline-none"
+                placeholder="Paste transfer token"
+              />
+              <select
+                id="transfer-target"
+                className="text-xs w-full bg-surface mb-2 p-2 rounded border border-outline-variant outline-none"
+                defaultValue=""
+              >
+                <option value="" disabled>
+                  Select disconnected seat...
+                </option>
+                {gameState.players
+                  .filter((player) => player.isConnected === false)
+                  .map((player) => (
+                    <option key={player.id} value={player.id}>
+                      {player.name} ({player.id})
+                    </option>
+                  ))}
+              </select>
+              <button
+                onClick={() => {
+                  const targetId = (
+                    document.getElementById("transfer-target") as HTMLSelectElement
+                  ).value;
+                  if (!targetId || !seatTransferToken.trim()) {
+                    return;
+                  }
+                  sendMessage({
+                    type: "HOST_ACTION",
+                    action: "REASSIGN_SEAT",
+                    targetId,
+                    transferToken: seatTransferToken.trim(),
+                  });
+                  setSeatTransferToken("");
+                }}
+                className="bg-primary text-on-primary text-[10px] font-label-md py-2 px-2 rounded w-full shadow-sm hover:bg-primary/90 transition-colors"
+              >
+                Approve Seat Transfer
+              </button>
             </div>
 
             <div className="border-t border-outline-variant pt-3">

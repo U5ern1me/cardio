@@ -1,4 +1,3 @@
-import crypto from "crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { __dangerouslyCorruptSnapshotForTest } from "./db";
@@ -7,81 +6,21 @@ import {
   startServer,
   stopServer,
 } from "./index";
-
-type WireEvent = Record<string, unknown>;
+import { runReconnectStorm } from "./testUtils/chaos.js";
+import {
+  closeSocket,
+  createMessageIdFactory,
+  openClient as openWsClient,
+  send,
+  waitForEvent,
+} from "./testUtils/wsHarness.js";
 
 let serverPort = 0;
 const openSockets = new Set<WebSocket>();
-let idCounter = 0;
-
-function nextMessageId(prefix: string): string {
-  idCounter += 1;
-  return `${prefix}-${Date.now()}-${idCounter}-${crypto.randomBytes(2).toString("hex")}`;
-}
+const nextMessageId = createMessageIdFactory("multi");
 
 async function openClient(): Promise<WebSocket> {
-  const ws = new WebSocket(`ws://127.0.0.1:${serverPort}/ws`);
-  openSockets.add(ws);
-  await new Promise<void>((resolve, reject) => {
-    const onOpen = () => {
-      ws.off("error", onError);
-      resolve();
-    };
-    const onError = (err: Error) => {
-      ws.off("open", onOpen);
-      reject(err);
-    };
-    ws.once("open", onOpen);
-    ws.once("error", onError);
-  });
-  return ws;
-}
-
-function send(ws: WebSocket, payload: Record<string, unknown>) {
-  ws.send(JSON.stringify(payload));
-}
-
-function closeSocket(ws: WebSocket): Promise<void> {
-  return new Promise((resolve) => {
-    if (ws.readyState >= WebSocket.CLOSING) {
-      resolve();
-      return;
-    }
-    const timeout = setTimeout(() => resolve(), 400);
-    ws.once("close", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-    ws.close();
-  });
-}
-
-function waitForEvent(
-  ws: WebSocket,
-  predicate: (event: WireEvent) => boolean,
-  timeoutMs = 4_000,
-): Promise<WireEvent> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      ws.off("message", onMessage);
-      reject(new Error("Timed out waiting for websocket event"));
-    }, timeoutMs);
-
-    const onMessage = (raw: WebSocket.RawData) => {
-      try {
-        const parsed = JSON.parse(raw.toString()) as WireEvent;
-        if (predicate(parsed)) {
-          clearTimeout(timeout);
-          ws.off("message", onMessage);
-          resolve(parsed);
-        }
-      } catch {
-        // ignore malformed frames in tests
-      }
-    };
-
-    ws.on("message", onMessage);
-  });
+  return openWsClient(serverPort, openSockets);
 }
 
 async function createAndJoinHost(gameType: string) {
@@ -449,31 +388,18 @@ describe("multiplayer security and reconnect hardening", () => {
   it("stays stable under reconnect storms", async () => {
     const { host, sessionId, inviteToken } = await createAndJoinHost("LITERATURE");
     const { player, playerState } = await joinPlayer(sessionId, inviteToken, "Storm");
-    let reconnectToken = String(playerState.reconnectToken);
+    const reconnectToken = String(playerState.reconnectToken);
+    await closeSocket(player);
+    openSockets.delete(player);
 
-    let activePlayerSocket = player;
-    for (let i = 0; i < 20; i += 1) {
-      await closeSocket(activePlayerSocket);
-      openSockets.delete(activePlayerSocket);
-
-      const reconnectClient = await openClient();
-      send(reconnectClient, {
-        type: "JOIN_SESSION",
-        sessionId,
-        reconnectToken,
-        messageId: nextMessageId(`storm-${i}`),
-      });
-
-      const joined = await waitForEvent(
-        reconnectClient,
-        (msg) =>
-          msg.type === "SESSION_JOINED" &&
-          msg.resumed === true &&
-          typeof msg.reconnectToken === "string",
-      );
-      reconnectToken = String(joined.reconnectToken);
-      activePlayerSocket = reconnectClient;
-    }
+    await runReconnectStorm({
+      iterations: 20,
+      serverPort,
+      openSockets,
+      sessionId,
+      reconnectToken,
+      nextMessageId,
+    });
 
     const hostState = await waitForEvent(
       host,
@@ -487,6 +413,127 @@ describe("multiplayer security and reconnect hardening", () => {
       Record<string, unknown>
     >;
     expect(players.length).toBe(2);
+  });
+
+  it("rejects unsupported protocol versions with typed reject events", async () => {
+    const client = await openClient();
+    send(client, {
+      protocolVersion: 99,
+      type: "CREATE_SESSION",
+      gameType: "LITERATURE",
+      messageId: nextMessageId("bad-version"),
+      requestId: nextMessageId("req-version"),
+    });
+
+    const rejected = await waitForEvent(
+      client,
+      (msg) =>
+        msg.type === "REJECT" &&
+        msg.code === "UNSUPPORTED_PROTOCOL" &&
+        typeof msg.message === "string",
+    );
+    expect(rejected.code).toBe("UNSUPPORTED_PROTOCOL");
+  });
+
+  it("supports deterministic seat transfer reclaim flow", async () => {
+    const { host, sessionId, inviteToken } = await createAndJoinHost("LITERATURE");
+    const { player, playerState } = await joinPlayer(sessionId, inviteToken, "SeatOwner");
+    const originalPlayerId = String(playerState.yourPlayerId);
+    const staleReconnectToken = String(playerState.reconnectToken);
+    await closeSocket(player);
+    openSockets.delete(player);
+    await waitForEvent(
+      host,
+      (msg) =>
+        msg.type === "STATE_UPDATE" &&
+        typeof msg.state === "object" &&
+        msg.state !== null &&
+        Array.isArray((msg.state as Record<string, unknown>).players) &&
+        ((msg.state as Record<string, unknown>).players as Array<Record<string, unknown>>)
+          .some(
+            (entry) =>
+              entry.id === originalPlayerId && entry.isConnected === false,
+          ),
+      6_000,
+    );
+
+    const spectator = await openClient();
+    send(spectator, {
+      type: "JOIN_SESSION",
+      sessionId,
+      inviteToken,
+      joinAs: "SPECTATOR",
+      messageId: nextMessageId("spectator-seat-join"),
+      requestId: nextMessageId("spectator-seat-join-req"),
+    });
+    await waitForEvent(
+      spectator,
+      (msg) => msg.type === "SESSION_JOINED" && msg.role === "SPECTATOR",
+    );
+
+    send(spectator, {
+      type: "REQUEST_SEAT_TRANSFER",
+      displayName: "TakeOver",
+      messageId: nextMessageId("seat-request"),
+      requestId: nextMessageId("seat-request-req"),
+    });
+    const seatRequest = await waitForEvent(
+      host,
+      (msg) =>
+        msg.type === "SEAT_TRANSFER_REQUEST" &&
+        typeof msg.transferToken === "string",
+    );
+    const transferToken = String(seatRequest.transferToken);
+
+    send(host, {
+      type: "HOST_ACTION",
+      action: "REASSIGN_SEAT",
+      targetId: originalPlayerId,
+      transferToken,
+      messageId: nextMessageId("seat-approve"),
+      requestId: nextMessageId("seat-approve-req"),
+    });
+
+    const granted = await waitForEvent(
+      spectator,
+      (msg) =>
+        msg.type === "SEAT_TRANSFER_GRANTED" &&
+        typeof msg.reconnectToken === "string",
+    );
+    const grantedReconnectToken = String(granted.reconnectToken);
+
+    send(spectator, {
+      type: "JOIN_SESSION",
+      sessionId,
+      reconnectToken: grantedReconnectToken,
+      messageId: nextMessageId("seat-claim"),
+      requestId: nextMessageId("seat-claim-req"),
+    });
+    const claimed = await waitForEvent(
+      spectator,
+      (msg) =>
+        msg.type === "SESSION_JOINED" &&
+        msg.resumed === true &&
+        typeof msg.reconnectToken === "string",
+    );
+    expect(claimed.resumed).toBe(true);
+
+    const staleClient = await openClient();
+    send(staleClient, {
+      type: "JOIN_SESSION",
+      sessionId,
+      reconnectToken: staleReconnectToken,
+      messageId: nextMessageId("seat-stale"),
+      requestId: nextMessageId("seat-stale-req"),
+    });
+    const staleError = await waitForEvent(
+      staleClient,
+      (msg) =>
+        (msg.type === "REJECT" || msg.type === "ERROR") &&
+        typeof msg.message === "string" &&
+        String(msg.message).includes("Stale reconnect token"),
+    );
+    expect(String(staleError.message)).toContain("Stale reconnect token");
   });
 
   it("applies token-bucket rate limiting on sustained bursts", async () => {

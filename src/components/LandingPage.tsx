@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useGame } from "../context/GameContext";
+import { useGame } from "../context/GameContextStore";
 import type { GameType } from "../shared/types";
 import Instructions from "./Instructions";
 
