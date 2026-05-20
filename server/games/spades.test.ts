@@ -4,7 +4,7 @@ import { setupSpades } from '../../src/games/spades/logic';
 import type { GameState, Player } from '../../src/games/spades/types';
 
 function makePlayer(id: string, name: string): Player {
-  return { id, name, hand: [], bid: null, tricksTaken: 0, bags: 0, team: 'TEAM_A', isConnected: true } as any;
+  return { id, name, hand: [], bid: null, tricksTaken: 0, bags: 0, team: 'TEAM_A', isConnected: true, seatIndex: 0 };
 }
 
 function makeLobbyState(players: Player[]): GameState {
@@ -23,7 +23,7 @@ function makeLobbyState(players: Player[]): GameState {
     spadesBroken: false,
     moveLog: [],
     lastMove: null,
-  } as any;
+  };
 }
 
 describe('Spades Server Handler Tests', () => {
@@ -31,8 +31,6 @@ describe('Spades Server Handler Tests', () => {
   const P2 = makePlayer('p2', 'Bob');
   const P3 = makePlayer('p3', 'Carol');
   const P4 = makePlayer('p4', 'Dave');
-  
-  const broadcastMock = () => {};
 
   describe('START_GAME', () => {
     it('starts game with exactly 4 players', () => {
@@ -51,7 +49,7 @@ describe('Spades Server Handler Tests', () => {
 
   describe('GAME_ACTION', () => {
     it('rejects action if not active player', () => {
-      let state = setupSpades(makeLobbyState([P1, P2, P3, P4]));
+      const state = setupSpades(makeLobbyState([P1, P2, P3, P4]));
       state.activePlayerIndex = 1; // Bob's turn
       
       const result = handleAction(state, { type: 'PLACE_BID', actorId: 'p1', bid: 3 });
@@ -59,7 +57,7 @@ describe('Spades Server Handler Tests', () => {
     });
 
     it('handles PLACE_BID', () => {
-      let state = JSON.parse(JSON.stringify(setupSpades(makeLobbyState([P1, P2, P3, P4]))));
+      const state = JSON.parse(JSON.stringify(setupSpades(makeLobbyState([P1, P2, P3, P4]))));
       
       const result = handleAction(state, { type: 'PLACE_BID', actorId: 'p1', bid: 3 });
       expect(result.error).toBeUndefined();
@@ -67,7 +65,7 @@ describe('Spades Server Handler Tests', () => {
     });
 
     it('handles PLAY_CARD', () => {
-      let state = JSON.parse(JSON.stringify(setupSpades(makeLobbyState([P1, P2, P3, P4]))));
+      const state = JSON.parse(JSON.stringify(setupSpades(makeLobbyState([P1, P2, P3, P4]))));
       state.phase = 'PLAYING';
       state.currentTrick = { leadSuit: null, cards: [] };
       state.players[0].hand[0] = { suit: 'CLUB', rank: 'A' };

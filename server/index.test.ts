@@ -37,7 +37,7 @@ describe("Server Index Tests", () => {
         winner: undefined,
       };
 
-      const sanitized = sanitizeStateForPlayer(state as any, "p0");
+      const sanitized = sanitizeStateForPlayer(state, "p0");
       // Hitler shouldn't see fascists in 7 player game
       expect(sanitized.players[1].role).toBeUndefined();
     });
@@ -75,7 +75,7 @@ describe("Server Index Tests", () => {
         winner: undefined,
       };
 
-      const sanitized = sanitizeStateForPlayer(state as any, "p0");
+      const sanitized = sanitizeStateForPlayer(state, "p0");
       // Hitler should see fascists in 5 player game
       expect(sanitized.players[1].role).toBe("FASCIST");
     });
@@ -94,7 +94,12 @@ describe("Server Index Tests", () => {
         },
       };
 
-      const sanitized = sanitizeStateForPlayer(state as any, "p1");
+      const sanitized = sanitizeStateForPlayer(state as unknown as GameState, "p1") as unknown as {
+        deck?: unknown;
+        hands: Record<string, unknown>;
+        cardCounts: Record<string, number>;
+        playerCardCounts: Record<string, number>;
+      };
       expect(sanitized.deck).toBeUndefined(); // Deck hidden
       expect(sanitized.hands["p1"]).toBeDefined(); // Can see own hand
       expect(sanitized.hands["p2"]).toBeUndefined(); // Cannot see other hand

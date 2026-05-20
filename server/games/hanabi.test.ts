@@ -49,7 +49,7 @@ describe('Hanabi Server Handler Tests', () => {
 
   describe('GAME_ACTION', () => {
     it('rejects action if not active player', () => {
-      let state = setupHanabi(makeLobbyState([P1, P2]));
+      const state = setupHanabi(makeLobbyState([P1, P2]));
       state.activePlayerIndex = 1; // Bob's turn
       
       const result = handleAction(state, { type: 'DISCARD_CARD', actorId: 'p1', cardIndex: 0 });
@@ -57,7 +57,7 @@ describe('Hanabi Server Handler Tests', () => {
     });
 
     it('handles PLAY_CARD', () => {
-      let state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
+      const state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
       state.players[0].hand[0] = { id: 'test', color: 'RED', rank: 1 };
       
       const result = handleAction(state, { type: 'PLAY_CARD', actorId: 'p1', cardIndex: 0 });
@@ -66,7 +66,7 @@ describe('Hanabi Server Handler Tests', () => {
     });
 
     it('handles DISCARD', () => {
-      let state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
+      const state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
       state.hintTokens = 5;
       
       const result = handleAction(state, { type: 'DISCARD_CARD', actorId: 'p1', cardIndex: 0 });
@@ -75,7 +75,7 @@ describe('Hanabi Server Handler Tests', () => {
     });
 
     it('handles HINT', () => {
-      let state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
+      const state = JSON.parse(JSON.stringify(setupHanabi(makeLobbyState([P1, P2]))));
       // Force P2 hand to have a RED card
       state.players[1].hand[0] = { id: 'test-h', color: 'RED', rank: 1 };
       

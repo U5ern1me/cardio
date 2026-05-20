@@ -40,7 +40,7 @@ describe('Hanabi Logic', () => {
 
   it('should allow playing a valid card', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2')];
-    let state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
+    const state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
     
     // Force first card to be Red 1
     state.players[0].hand[0] = { id: 'test-card', color: 'RED', rank: 1 };
@@ -53,7 +53,7 @@ describe('Hanabi Logic', () => {
 
   it('should increment mistake token on invalid play', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2')];
-    let state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
+    const state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
     
     // Force first card to be Red 2 (Red 1 not played yet)
     state.players[0].hand[0] = { id: 'test-card', color: 'RED', rank: 2 };
@@ -65,7 +65,7 @@ describe('Hanabi Logic', () => {
 
   it('should allow discarding a card to regain hint token', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2')];
-    let state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
+    const state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
     state.hintTokens = 5;
     
     const result = discardCard(state, '1', 0);
@@ -75,7 +75,7 @@ describe('Hanabi Logic', () => {
 
   it('should allow giving a hint', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2')];
-    let state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
+    const state = JSON.parse(JSON.stringify(setupHanabi(makeState(players))));
     
     // Force P2 hand
     state.players[1].hand = [

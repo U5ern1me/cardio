@@ -6,6 +6,7 @@ import type {
   Player,
   HalfSuitName,
   GameState as LiteratureGameState,
+  ClaimedBook,
 } from "./types";
 import { getHalfSuit, getCardsInHalfSuit, isSameCard } from "./logic";
 
@@ -347,18 +348,18 @@ export default function LiteratureBoard() {
   const activePlayer = gameState.players[gameState.activePlayerIndex];
   const isMyTurn = activePlayer?.id === myPlayerId;
   const myPlayer = gameState.players.find(
-    (p: any) => p.id === myPlayerId,
+    (p: Player) => p.id === myPlayerId,
   ) as Player;
   const opponents = gameState.players.filter(
-    (p: any) => p.team !== myPlayer?.team,
+    (p: Player) => p.team !== myPlayer?.team,
   );
   const otherPlayers = gameState.players.filter(
-    (p: any) => p.id !== myPlayerId,
+    (p: Player) => p.id !== myPlayerId,
   );
 
   // Group + sort hand
   const groupedHand: Record<string, Card[]> = {};
-  myHand.forEach((c: any) => {
+  myHand.forEach((c: Card) => {
     const hs = getHalfSuit(c);
     if (!groupedHand[hs]) groupedHand[hs] = [];
     groupedHand[hs].push(c);
@@ -440,7 +441,7 @@ export default function LiteratureBoard() {
           {/* Claimed Books */}
           <div className="absolute inset-0 flex flex-wrap items-center justify-center gap-2 p-8 overflow-hidden z-10">
             {gameState.books && gameState.books.length > 0 ? (
-              gameState.books.map((book: any, idx: number) => (
+              gameState.books.map((book: ClaimedBook, idx: number) => (
                 <div
                   key={`${book.halfSuit}-${idx}`}
                   className={`px-2 py-1 rounded text-[10px] font-bold shadow-sm ${book.team === "TEAM_A" ? "bg-primary-container text-on-primary-container" : "bg-secondary-container text-on-secondary-container"}`}
@@ -463,7 +464,7 @@ export default function LiteratureBoard() {
 
         {/* Desktop Seats */}
         <div className="hidden md:block">
-          {otherPlayers.map((p: any, i: number) => (
+          {otherPlayers.map((p: Player, i: number) => (
             <div
               key={p.id}
               className="absolute"
@@ -482,7 +483,7 @@ export default function LiteratureBoard() {
 
         {/* Mobile Opponent Carousel */}
         <div className="md:hidden flex overflow-x-auto px-4 py-4 gap-3 no-scrollbar absolute top-0 left-0 w-full z-10 bg-surface/50 backdrop-blur-sm border-b border-outline-variant">
-          {otherPlayers.map((p: any) => (
+          {otherPlayers.map((p: Player) => (
             <div key={p.id} className="flex-shrink-0">
               <PlayerSeat
                 player={p}

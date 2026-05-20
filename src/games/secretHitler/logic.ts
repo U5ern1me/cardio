@@ -186,7 +186,7 @@ export function topDeckChaosPolicy(state: SecretHitlerState): SecretHitlerState 
 }
 
 export function enactPolicy(state: SecretHitlerState, policy: Policy, isChaos = false): SecretHitlerState {
-  let next: SecretHitlerState = {
+  const next: SecretHitlerState = {
     ...state,
     presidentCards: [],
     chancellorCards: [],
@@ -244,7 +244,7 @@ export function enactPolicy(state: SecretHitlerState, policy: Policy, isChaos = 
 }
 
 export function moveToNextGovernment(state: SecretHitlerState): SecretHitlerState {
-  let next = {
+  const next = {
     ...state,
     nominatedChancellorId: null,
     chancellorId: null,

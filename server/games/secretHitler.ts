@@ -6,8 +6,19 @@ function isAlivePlayer(state: SecretHitlerState, playerId: string | null): boole
   return !!state.players.find((p) => p.id === playerId && p.isAlive);
 }
 
-export function handleAction(state: SecretHitlerState, data: any) {
-  const actorId = data.actorId as string | null;
+interface ActionData {
+  type: string;
+  action?: string;
+  actorId?: string | null;
+  test?: boolean;
+  targetId?: string;
+  vote?: Vote;
+  policy?: Policy;
+  accept?: boolean;
+}
+
+export function handleAction(state: SecretHitlerState, data: ActionData) {
+  const actorId = data.actorId ?? null;
   if (!actorId) return { error: 'Not joined as a player.' };
 
   switch (data.type) {

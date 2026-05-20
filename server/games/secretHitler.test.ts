@@ -55,7 +55,7 @@ describe('Secret Hitler Server Handler Tests', () => {
 
   describe('NOMINATE_CHANCELLOR', () => {
     it('transitions to VOTING', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       const result = handleAction(state, { type: 'SECRET_HITLER_ACTION', action: 'NOMINATE_CHANCELLOR', actorId: 'p1', targetId: 'p2' });
       expect(result.error).toBeUndefined();
       expect(result.state?.phase).toBe('VOTING');
@@ -65,15 +65,15 @@ describe('Secret Hitler Server Handler Tests', () => {
 
   describe('CAST_VOTE', () => {
     it('processes votes and transitions correctly on pass', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'VOTING';
       state.nominatedChancellorId = 'p2';
       
       let res = handleAction(state, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p1', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p2', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p3', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p4', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p5', vote: 'NEIN' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p2', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p3', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p4', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p5', vote: 'NEIN' });
       
       expect(res.error).toBeUndefined();
       expect(res.state?.phase).toBe('LEGISLATIVE_PRESIDENT');
@@ -81,7 +81,7 @@ describe('Secret Hitler Server Handler Tests', () => {
     });
 
     it('handles Hitler elected as Chancellor (Fascist Win)', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'VOTING';
       state.nominatedChancellorId = 'p3';
       state.fascistPolicies = 3;
@@ -90,10 +90,10 @@ describe('Secret Hitler Server Handler Tests', () => {
       state.players[2].role = 'HITLER';
 
       let res = handleAction(state, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p1', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p2', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p3', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p4', vote: 'JA' });
-      res = handleAction(res.state as any, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p5', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p2', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p3', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p4', vote: 'JA' });
+      res = handleAction(res.state!, { type: 'SECRET_HITLER_ACTION', action: 'CAST_VOTE', actorId: 'p5', vote: 'JA' });
 
       expect(res.state?.phase).toBe('GAME_OVER');
       expect(res.state?.winner).toBe('FASCIST');
@@ -103,7 +103,7 @@ describe('Secret Hitler Server Handler Tests', () => {
 
   describe('EXECUTIVE ACTIONS', () => {
     it('handles POLICY_PEEK', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'EXECUTIVE_ACTION';
       state.executiveAction = 'POLICY_PEEK';
       state.presidentId = 'p1';
@@ -117,7 +117,7 @@ describe('Secret Hitler Server Handler Tests', () => {
     });
 
     it('handles INVESTIGATE', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'EXECUTIVE_ACTION';
       state.executiveAction = 'INVESTIGATE';
       state.presidentId = 'p1';
@@ -133,13 +133,13 @@ describe('Secret Hitler Server Handler Tests', () => {
       expect(res.state?.phase).toBe('NOMINATE_CHANCELLOR');
       expect(res.state?.executiveAction).toBeNull();
       
-      const investigateResults = res.state?.investigateResults as any;
-      expect(investigateResults['p1'].targetName).toBe('Bob');
-      expect(investigateResults['p1'].party).toBe('FASCIST');
+      const investigateResults = res.state!.investigateResults;
+      expect(investigateResults['p1']?.targetName).toBe('Bob');
+      expect(investigateResults['p1']?.party).toBe('FASCIST');
     });
 
     it('handles EXECUTION (Liberal dies)', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'EXECUTIVE_ACTION';
       state.executiveAction = 'EXECUTE';
       state.presidentId = 'p1';
@@ -158,7 +158,7 @@ describe('Secret Hitler Server Handler Tests', () => {
     });
 
     it('handles EXECUTION (Hitler dies - Liberal Win)', () => {
-      let state = setupSecretHitler(makeLobbyState(players));
+      const state = setupSecretHitler(makeLobbyState(players));
       state.phase = 'EXECUTIVE_ACTION';
       state.executiveAction = 'EXECUTE';
       state.presidentId = 'p1';

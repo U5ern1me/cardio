@@ -492,7 +492,7 @@ describe('handleClaim', () => {
     ];
 
     // Pre-claim 7 books, then claim the 8th
-    let state = makePlayingState(eightPlayers, {
+    const state = makePlayingState(eightPlayers, {
       p0: getCardsInHalfSuit('HIGH_SPADE'),
       p1: [], p2: [], p3: [], p4: [], p5: [], p6: [], p7: [],
     });

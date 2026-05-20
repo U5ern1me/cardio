@@ -304,13 +304,15 @@ export default function Lobby() {
   );
 }
 
+import type { Player } from "../shared/types.js";
+
 function PlayerCard({
   p,
   isMe,
   isHost,
   color,
 }: {
-  p: any;
+  p: Player;
   isMe: boolean;
   isHost: boolean;
   color: "primary" | "secondary";

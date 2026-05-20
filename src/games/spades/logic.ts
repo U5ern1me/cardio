@@ -55,7 +55,7 @@ export function placeBid(state: GameState, playerId: string, bid: number): { sta
   const player = state.players.find(p => p.id === playerId);
   if (!player) return { error: 'Player not found' };
 
-  let newState = { ...state };
+  const newState = { ...state };
   newState.players = newState.players.map(p => 
     p.id === playerId ? { ...p, bid: Math.max(0, Math.min(bid, 13)) } : p
   );
@@ -85,7 +85,7 @@ export function playCard(state: GameState, playerId: string, card: Card): { stat
   const cardIndex = player.hand.findIndex(c => c.suit === card.suit && c.rank === card.rank);
   if (cardIndex === -1) return { error: 'Card not in hand' };
 
-  let leadSuit = state.currentTrick.cards.length === 0 ? card.suit : state.currentTrick.leadSuit;
+  const leadSuit = state.currentTrick.cards.length === 0 ? card.suit : state.currentTrick.leadSuit;
 
   if (state.currentTrick.cards.length === 0) {
     if (card.suit === 'SPADE' && !state.spadesBroken && !canOnlyPlaySpades(player)) {
@@ -125,7 +125,7 @@ export function playCard(state: GameState, playerId: string, card: Card): { stat
 export function resolveTrick(state: GameState): GameState {
   const leadSuit = state.currentTrick.leadSuit;
   let highestCard = state.currentTrick.cards[0];
-  let hasSpade = state.currentTrick.cards.some(c => c.card.suit === 'SPADE');
+  const hasSpade = state.currentTrick.cards.some(c => c.card.suit === 'SPADE');
 
   for (const play of state.currentTrick.cards) {
     if (hasSpade && play.card.suit === 'SPADE') {

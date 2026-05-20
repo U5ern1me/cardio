@@ -38,7 +38,7 @@ describe('Love Letter Logic', () => {
 
   it('should handle Guard correctly', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3')];
-    let state = setupLoveLetter(makeState(players));
+    const state = setupLoveLetter(makeState(players));
     
     // P1 plays Guard on P2, guessing Priest
     state.players[0].hand = [{ role: 'GUARD', value: 1 }, { role: 'KING', value: 6 }];
@@ -50,7 +50,7 @@ describe('Love Letter Logic', () => {
 
   it('should enforce Countess restriction', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3')];
-    let state = setupLoveLetter(makeState(players));
+    const state = setupLoveLetter(makeState(players));
     
     state.players[0].hand = [{ role: 'COUNTESS', value: 7 }, { role: 'KING', value: 6 }];
     
@@ -61,12 +61,12 @@ describe('Love Letter Logic', () => {
 
   it('should handle Handmaid protection', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3')];
-    let state = setupLoveLetter(makeState(players));
+    const state = setupLoveLetter(makeState(players));
     
     // P1 plays Handmaid
     state.players[0].hand = [{ role: 'HANDMAID', value: 4 }, { role: 'GUARD', value: 1 }];
     const res1 = playCard(state, '1', 'HANDMAID');
-    let newState = res1.state!;
+    const newState = res1.state!;
     expect(newState.handmaidProtections).toContain('1');
     
     // P2 tries to play Guard on P1
@@ -77,7 +77,7 @@ describe('Love Letter Logic', () => {
 
   it('should handle Princess elimination', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3')];
-    let state = setupLoveLetter(makeState(players));
+    const state = setupLoveLetter(makeState(players));
     
     state.players[0].hand = [{ role: 'PRINCESS', value: 8 }, { role: 'GUARD', value: 1 }];
     const result = playCard(state, '1', 'PRINCESS');

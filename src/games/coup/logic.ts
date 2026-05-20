@@ -1,4 +1,4 @@
-import type { GameState, CoupRole, Player, Move } from './types';
+import type { GameState, CoupRole, Player, Move, CoupActionType } from './types';
 
 export const ROLES: CoupRole[] = ['DUKE', 'ASSASSIN', 'CAPTAIN', 'AMBASSADOR', 'CONTESSA'];
 
@@ -18,8 +18,14 @@ export function formatActionName(type: string): string {
 }
 
 export function formatRoleName(role: string): string {
-  if (!role || role === 'HIDDEN') return 'Unknown';
-  return role.charAt(0) + role.slice(1).toLowerCase();
+  switch (role) {
+    case 'DUKE': return 'Duke';
+    case 'ASSASSIN': return 'Assassin';
+    case 'CAPTAIN': return 'Captain';
+    case 'AMBASSADOR': return 'Ambassador';
+    case 'CONTESSA': return 'Contessa';
+    default: return role;
+  }
 }
 
 export function createDeck(playerCount: number): CoupRole[] {
@@ -100,12 +106,12 @@ export function getAlivePlayers(players: Player[]): Player[] {
 
 // Basic action processing (Income, Foreign Aid, Coup)
 // Character actions (Tax, Assassinate, Steal, Exchange) will initially mark a 'pending' state
-export function handleBasicAction(state: GameState, actorId: string, type: any, targetId?: string): GameState {
+export function handleBasicAction(state: GameState, actorId: string, type: CoupActionType, targetId?: string): GameState {
   const actor = state.players.find(p => p.id === actorId);
   if (!actor) return state;
 
   let details = '';
-  let success = true;
+  const success = true;
   const actionLabel = formatActionName(type);
   let coinsChange = 0;
 

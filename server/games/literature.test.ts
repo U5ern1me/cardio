@@ -60,7 +60,7 @@ describe("handleAction: START_GAME", () => {
     const result = handleAction(state, {
       type: "START_GAME",
       test: true,
-    } as any);
+    });
     expect(result.error).toBeUndefined();
     expect(result.state!.phase).toBe("PLAYING");
   });
@@ -77,7 +77,7 @@ describe("handleAction: START_GAME", () => {
     const result = handleAction(state, {
       type: "START_GAME",
       test: true,
-    } as any);
+    });
     for (const p of players) {
       expect(result.state!.hands[p.id].length).toBeGreaterThan(0);
     }

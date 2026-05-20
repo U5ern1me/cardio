@@ -52,7 +52,7 @@ describe('Spades Logic', () => {
 
   it('should enforce follow suit', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3'), makePlayer('4', 'P4')];
-    let state = setupSpades(makeState(players));
+    const state = setupSpades(makeState(players));
     state.phase = 'PLAYING';
     state.currentTrick = { leadSuit: 'HEART', cards: [{ playerId: '1', card: { suit: 'HEART', rank: 'A' } }] };
     
@@ -64,7 +64,7 @@ describe('Spades Logic', () => {
 
   it('should resolve trick correctly', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3'), makePlayer('4', 'P4')];
-    let state = setupSpades(makeState(players));
+    const state = setupSpades(makeState(players));
     state.phase = 'PLAYING';
     state.spadesBroken = false;
     state.currentTrick = { 
@@ -88,7 +88,7 @@ describe('Spades Logic', () => {
 
   it('should let highest spade win', () => {
     const players = [makePlayer('1', 'P1'), makePlayer('2', 'P2'), makePlayer('3', 'P3'), makePlayer('4', 'P4')];
-    let state = setupSpades(makeState(players));
+    const state = setupSpades(makeState(players));
     state.phase = 'PLAYING';
     state.currentTrick = { 
       leadSuit: 'HEART', 

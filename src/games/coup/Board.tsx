@@ -212,7 +212,7 @@ export default function CoupBoard() {
     sendMessage,
     clearSession,
   } = useGame();
-  const gameState = baseState as CoupGameState & { pendingAction?: any };
+  const gameState = baseState as CoupGameState;
   const [selectedTarget, setSelectedTarget] = useState<string | null>(null);
 
   if (!gameState || !myPlayerId) return null;
@@ -237,7 +237,7 @@ export default function CoupBoard() {
   const isResponsePhase =
     isChallengePhase || isBlockPhase || isBlockChallengePhase;
 
-  const handleAction = (type: string, targetId?: string, extra?: any) => {
+  const handleAction = (type: string, targetId?: string, extra?: Record<string, unknown>) => {
     sendMessage({
       type: "COUP_ACTION",
       actionType: type,

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useGame } from "../../context/GameContextStore";
 import RulesButton from "../../components/RulesButton";
-import type { GameState, LoveLetterRole } from "./types";
+import type { GameState, LoveLetterRole, Player, Card } from "./types";
 
 const ROLE_VALUES: Record<LoveLetterRole, number> = {
   GUARD: 1,
@@ -60,7 +60,7 @@ export default function LoveLetterBoard() {
 
   const handlePlayCard = () => {
     if (selectedCardRole && isCurrentPlayerTurn) {
-      const action: any = { type: "PLAY_CARD", cardRole: selectedCardRole };
+      const action: { type: string; cardRole: LoveLetterRole; targetPlayerId?: string; guessedRole?: LoveLetterRole } = { type: "PLAY_CARD", cardRole: selectedCardRole };
 
       if (
         targetPlayerId &&
@@ -128,7 +128,7 @@ export default function LoveLetterBoard() {
         <div className="flex-grow flex flex-col relative w-full h-full justify-between items-center py-8">
           {/* Opponents Layout */}
           <div className="flex justify-center w-full relative h-[150px] mb-8">
-            {opponents.map((p: any, index: number) => {
+            {opponents.map((p: Player, index: number) => {
               // Simple arc positioning
               const positions = [
                 "absolute top-0 left-1/2 transform -translate-x-1/2",
@@ -256,7 +256,7 @@ export default function LoveLetterBoard() {
                   </label>
                   <div className="flex flex-wrap gap-2">
                     {getAliveOtherPlayers().length > 0 ? (
-                      getAliveOtherPlayers().map((p: any) => (
+                      getAliveOtherPlayers().map((p: Player) => (
                         <button
                           key={p.id}
                           onClick={() => setTargetPlayerId(p.id)}
@@ -334,7 +334,7 @@ export default function LoveLetterBoard() {
         {currentPlayer && !currentPlayer.isEliminated && (
           <div className="w-full flex flex-col items-center justify-end z-10 mt-auto pt-4 relative">
             <div className="flex flex-wrap items-center justify-center gap-4 w-full max-w-3xl relative">
-              {(currentPlayer.hand || []).map((card: any, idx: number) => {
+              {(currentPlayer.hand || []).map((card: Card, idx: number) => {
                 const isSelected = selectedCardRole === card.role;
                 const roleValue = ROLE_VALUES[card.role as LoveLetterRole];
                 const icon = ROLE_ICONS[card.role as LoveLetterRole];

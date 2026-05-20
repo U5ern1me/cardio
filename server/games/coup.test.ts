@@ -39,7 +39,7 @@ describe('Coup Server Handler Tests', () => {
 
   describe('COUP_ACTION - INCOME', () => {
     it('handles income action', () => {
-      let state = setupCoup(makeLobbyState([P1, P2, P3]));
+      const state = setupCoup(makeLobbyState([P1, P2, P3]));
       const result = handleAction(state, { type: 'COUP_ACTION', actorId: 'p1', actionType: 'INCOME' }, broadcastMock);
       expect(result.state.players[0].coins).toBe(3);
     });
@@ -47,14 +47,14 @@ describe('Coup Server Handler Tests', () => {
 
   describe('COUP_ACTION - Character Actions', () => {
     it('transitions to WAITING_FOR_CHALLENGE on TAX', () => {
-      let state = setupCoup(makeLobbyState([P1, P2, P3]));
+      const state = setupCoup(makeLobbyState([P1, P2, P3]));
       const result = handleAction(state, { type: 'COUP_ACTION', actorId: 'p1', actionType: 'TAX' }, broadcastMock);
       expect(result.state.phase).toBe('WAITING_FOR_CHALLENGE');
       expect(result.state.pendingAction.type).toBe('TAX');
     });
     
     it('transitions to WAITING_FOR_BLOCK on FOREIGN_AID', () => {
-      let state = setupCoup(makeLobbyState([P1, P2, P3]));
+      const state = setupCoup(makeLobbyState([P1, P2, P3]));
       const result = handleAction(state, { type: 'COUP_ACTION', actorId: 'p1', actionType: 'FOREIGN_AID' }, broadcastMock);
       expect(result.state.phase).toBe('WAITING_FOR_BLOCK');
     });

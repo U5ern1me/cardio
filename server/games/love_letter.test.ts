@@ -46,7 +46,7 @@ describe('Love Letter Server Handler Tests', () => {
 
   describe('GAME_ACTION', () => {
     it('rejects action if not active player', () => {
-      let state = setupLoveLetter(makeLobbyState([P1, P2]));
+      const state = setupLoveLetter(makeLobbyState([P1, P2]));
       state.activePlayerIndex = 1; // Bob's turn
       
       const result = handleAction(state, { type: 'PLAY_CARD', actorId: 'p1', cardRole: 'GUARD', targetPlayerId: 'p2', guessedRole: 'PRIEST' });
@@ -54,7 +54,7 @@ describe('Love Letter Server Handler Tests', () => {
     });
 
     it('rejects PRINCE action if no target is provided', () => {
-      let state = setupLoveLetter(makeLobbyState([P1, P2]));
+      const state = setupLoveLetter(makeLobbyState([P1, P2]));
       state.activePlayerIndex = 0;
       
       const result = handleAction(state, { type: 'PLAY_CARD', actorId: 'p1', cardRole: 'PRINCE' });
@@ -62,7 +62,7 @@ describe('Love Letter Server Handler Tests', () => {
     });
 
     it('handles playing a card', () => {
-      let state = JSON.parse(JSON.stringify(setupLoveLetter(makeLobbyState([P1, P2]))));
+      const state = JSON.parse(JSON.stringify(setupLoveLetter(makeLobbyState([P1, P2]))));
       state.deck = [{ role: 'GUARD', value: 1 }, { role: 'GUARD', value: 1 }]; // Ensure deck not empty
       state.players[0].hand = [{ role: 'GUARD', value: 1 }, { role: 'PRIEST', value: 2 }];
       state.players[1].hand = [{ role: 'BARON', value: 3 }]; // Ensure they don't have a PRIEST

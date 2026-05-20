@@ -52,7 +52,7 @@ export function handleAction(state: GameState, data: ActionData): ActionResult {
         type: 'PLAY_CARD',
         timestamp: new Date().toISOString(),
         playerName: actor.name,
-        details: `${actor.name} played ${data.cardRole}${data.targetPlayerId ? ' on ' + state.players.find((p: any) => p.id === data.targetPlayerId)?.name : ''}`,
+        details: `${actor.name} played ${data.cardRole}${data.targetPlayerId ? ' on ' + state.players.find((p: Player) => p.id === data.targetPlayerId)?.name : ''}`,
         success: true
       };
 

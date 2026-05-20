@@ -52,7 +52,7 @@ export function setupHanabi(state: GameState): GameState {
     ...state,
     players,
     deck,
-    playArea: { RED: 0, BLUE: 0, GREEN: 0, YELLOW: 0, WHITE: 0 } as any,
+    playArea: { RED: 0, BLUE: 0, GREEN: 0, YELLOW: 0, WHITE: 0 },
     discardPile: [],
     hintTokens: 8,
     mistakeTokens: 0,
@@ -64,7 +64,7 @@ export function setupHanabi(state: GameState): GameState {
 }
 
 function advanceTurn(state: GameState): GameState {
-  let newState = { ...state };
+  const newState = { ...state };
   
   if (newState.turnsLeft !== null) {
     newState.turnsLeft -= 1;
@@ -191,7 +191,7 @@ export function giveHint(
     return { error: 'Hint must apply to at least one card' };
   }
 
-  let newState = {
+  const newState = {
     ...state,
     hintTokens: state.hintTokens - 1,
     players: state.players.map(p => p.id === toPlayerId ? { ...p, hand: newHand } : p)

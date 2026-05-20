@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useGame } from "../../context/GameContextStore";
 import RulesButton from "../../components/RulesButton";
-import type { GameState, HanabiColor, HanabiRank } from "./types";
+import type { GameState, HanabiColor, HanabiRank, Player, Card } from "./types";
 
 const COLORS: HanabiColor[] = ["RED", "BLUE", "GREEN", "YELLOW", "WHITE"];
 const RANKS: HanabiRank[] = [1, 2, 3, 4, 5];
@@ -250,7 +250,7 @@ export default function HanabiBoard() {
             </div>
 
             <div className="space-y-4">
-              {opponents.map((p: any) => (
+              {opponents.map((p: Player) => (
                 <div
                   key={p.id}
                   className="flex flex-col gap-2 bg-surface-container-lowest p-3 md:p-4 rounded-xl border border-outline-variant shadow-sm"
@@ -261,7 +261,7 @@ export default function HanabiBoard() {
                     </span>
                   </div>
                   <div className="flex gap-2 flex-grow overflow-x-auto pb-2 custom-scrollbar">
-                    {(p.hand || []).map((card: any, idx: number) => {
+                    {(p.hand || []).map((card: Card, idx: number) => {
                       const conf =
                         colorConfig[card.color as HanabiColor] ||
                         colorConfig.WHITE;
@@ -302,7 +302,7 @@ export default function HanabiBoard() {
                 disabled={!isCurrentPlayerTurn || state.hintTokens === 0}
               >
                 <option value="">Select a player</option>
-                {opponents.map((p: any) => (
+                {opponents.map((p: Player) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
                   </option>
@@ -401,7 +401,7 @@ export default function HanabiBoard() {
             </h3>
 
             <div className="flex justify-center gap-2 md:gap-4 flex-wrap">
-              {(currentPlayer.hand || []).map((card: any, idx: number) => {
+              {(currentPlayer.hand || []).map((card: Card, idx: number) => {
                 const isSelected = selectedCardIndex === idx;
                 // Use colors/ranks if available, otherwise just show as hidden
                 const hasColor = !!card.color;

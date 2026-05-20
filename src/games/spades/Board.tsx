@@ -267,7 +267,7 @@ export default function SpadesBoard() {
             state.currentTrick?.cards &&
             state.currentTrick.cards.length > 0 && (
               <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-10 flex gap-4">
-                {state.currentTrick.cards.map((play: any, idx: number) => {
+                {state.currentTrick.cards.map((play: { playerId: string; card: Card }, idx: number) => {
                   const isWinner = false; // Add logic if you want to highlight winning card later
                   return (
                     <div

@@ -187,7 +187,7 @@ export function advancePhase(state: GameState): GameState {
     return endRound(state);
   }
 
-  let newState = { ...state };
+  const newState = { ...state };
   let nextIndex = (newState.activePlayerIndex + 1) % newState.players.length;
   while (newState.players[nextIndex].isEliminated) {
     nextIndex = (nextIndex + 1) % newState.players.length;

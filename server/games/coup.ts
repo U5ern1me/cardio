@@ -1,15 +1,15 @@
 import * as CoupLogic from '../../src/games/coup/logic.js';
 
-import type { GameState, Role, ActionType, Player } from '../../src/games/coup/types.js';
+import type { GameState, CoupRole, CoupActionType, Player, Influence } from '../../src/games/coup/types.js';
 
 interface ActionData {
   type: string;
   actorId?: string;
   test?: boolean;
   timestamp?: number;
-  actionType?: ActionType;
+  actionType?: CoupActionType;
   targetId?: string;
-  roleClaimed?: Role;
+  roleClaimed?: CoupRole;
 }
 
 interface ActionResult {
@@ -17,7 +17,12 @@ interface ActionResult {
   error?: string;
 }
 
-export function handleAction(state: GameState, data: ActionData, broadcastState: (sid: string) => void, dispatch?: (action: any) => void): ActionResult {
+export function handleAction(
+  state: GameState,
+  data: ActionData,
+  broadcastState: (sid: string) => void,
+  dispatch?: (action: { type: string; timestamp?: number }) => void
+): ActionResult {
   const { actorId } = data;
   const actor = state.players.find((p: Player) => p.id === actorId);
 
@@ -79,7 +84,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
         // Standard Action Declaration
         if (actionType === 'ASSASSINATE' && actor.coins < 3) return { error: 'Not enough coins for Assassination' };
         
-        const nextPlayers = state.players.map((p: any) => 
+        const nextPlayers = state.players.map((p: Player) => 
           (actionType === 'ASSASSINATE' && p.id === actorId) ? { ...p, coins: p.coins - 3 } : p
         );
 
@@ -87,7 +92,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
         const actionLabel = CoupLogic.formatActionName(actionType);
         
         const phase = actionType === 'FOREIGN_AID' ? 'WAITING_FOR_BLOCK' : 'WAITING_FOR_CHALLENGE';
-        const targetName = targetId ? (state.players.find((p: any) => p.id === targetId)?.name || 'someone') : '';
+        const targetName = targetId ? (state.players.find((p: Player) => p.id === targetId)?.name || 'someone') : '';
         const details = actionType === 'FOREIGN_AID' 
           ? `${actor.name} is taking Foreign Aid. Waiting for blocks...`
           : `${actor.name} is choosing to ${actionLabel}${targetName ? ' on ' + targetName : ''}. Waiting for responses...`;
@@ -129,11 +134,12 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
         const action = state.pendingAction;
         const challengedPlayerId = isChallengingBlock ? action.blocks!.blockerId : action.actorId;
         const requiredRole = isChallengingBlock ? action.blocks!.roleClaimed : CoupLogic.getRequiredRole(action.type);
-        const challengedPlayer = state.players.find((p: any) => p.id === challengedPlayerId);
+        const challengedPlayer = state.players.find((p: Player) => p.id === challengedPlayerId);
+        if (!challengedPlayer) return { state };
         
-        const hasRole = challengedPlayer.influences.some((i: any) => !i.isRevealed && i.role === requiredRole);
+        const hasRole = challengedPlayer.influences.some((i: Influence) => !i.isRevealed && i.role === requiredRole);
 
-        let nextState = { ...state };
+        const nextState = { ...state };
 
         if (hasRole) {
           // Challenger loses influence
@@ -142,7 +148,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
           nextState.resolution = isChallengingBlock ? 'BLOCK_CHALLENGE_FAILED' : 'CHALLENGE_FAILED';
 
           // Truthful player swaps card
-          const { newPlayers, newDeck } = swapPlayerCard(state.players, challengedPlayerId, requiredRole as any, state.deck);
+          const { newPlayers, newDeck } = swapPlayerCard(state.players, challengedPlayerId, requiredRole as CoupRole, state.deck);
           nextState.players = newPlayers;
           nextState.deck = newDeck;
 
@@ -179,7 +185,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
           }
         };
 
-        const othersCount = state.players.filter((p: any) => p.influences.some((i: any) => !i.isRevealed)).length - 1;
+        const othersCount = state.players.filter((p: Player) => p.influences.some((i: Influence) => !i.isRevealed)).length - 1;
         if (nextState.pendingAction.challengers.length >= othersCount) {
           return { state: resolveAction(nextState, dispatch) };
         }
@@ -191,10 +197,10 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
         if (state.phase !== 'SELECT_INFLUENCE_TO_LOSE' || state.loserId !== actorId) return { state };
 
         const { influenceIndex } = data;
-        const loser = state.players.find((p: any) => p.id === actorId);
-        if (loser.influences[influenceIndex].isRevealed) return { state };
+        const loser = state.players.find((p: Player) => p.id === actorId);
+        if (!loser || loser.influences[influenceIndex].isRevealed) return { state };
 
-        const nextPlayers = state.players.map((p: any) => {
+        const nextPlayers = state.players.map((p: Player) => {
           if (p.id === actorId) {
             const nextInfluences = [...p.influences];
             nextInfluences[influenceIndex] = { ...nextInfluences[influenceIndex], isRevealed: true };
@@ -203,7 +209,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
           return p;
         });
 
-        let nextState = { ...state, players: nextPlayers };
+        const nextState = { ...state, players: nextPlayers };
 
         // Determine what happens next
         if (state.resolution === 'CHALLENGE_FAILED' || state.resolution === 'BLOCK_CHALLENGE_SUCCESSFUL') {
@@ -220,13 +226,13 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
       if (actionType === 'FINALIZE_EXCHANGE') {
         if (state.phase !== 'SELECTING_EXCHANGE_CARDS') return { state };
         const { selectedRoles } = data;
-        const unrevealedCount = actor.influences.filter((i: any) => !i.isRevealed).length;
+        const unrevealedCount = actor.influences.filter((i: Influence) => !i.isRevealed).length;
 
         if (selectedRoles.length !== unrevealedCount) return { error: `Must select exactly ${unrevealedCount} cards` };
 
         const currentOptions = [...state.exchangeOptions];
         selectedRoles.forEach((role: string) => {
-          const idx = currentOptions.indexOf(role);
+          const idx = currentOptions.indexOf(role as CoupRole);
           if (idx > -1) currentOptions.splice(idx, 1);
         });
 
@@ -234,9 +240,9 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
         CoupLogic.shuffle(newDeck);
 
         let selectedIdx = 0;
-        const nextPlayers = state.players.map((p: any) => {
+        const nextPlayers = state.players.map((p: Player) => {
           if (p.id === actorId) {
-            const nextInfluences = p.influences.map((inf: any) => {
+            const nextInfluences = p.influences.map((inf: Influence) => {
               if (!inf.isRevealed) {
                 return { ...inf, role: selectedRoles[selectedIdx++] };
               }
@@ -266,7 +272,7 @@ export function handleAction(state: GameState, data: ActionData, broadcastState:
   }
 }
 
-function startResolutionTimer(timestamp: number, dispatch?: (action: any) => void) {
+function startResolutionTimer(timestamp: number, dispatch?: (action: { type: string; timestamp?: number }) => void) {
   if (dispatch) {
     setTimeout(() => {
       dispatch({ type: 'TIMER_RESOLVE', timestamp });
@@ -274,13 +280,13 @@ function startResolutionTimer(timestamp: number, dispatch?: (action: any) => voi
   }
 }
 
-function swapPlayerCard(players: any[], playerId: string, role: string, deck: string[]) {
-  let newRole = '';
+function swapPlayerCard(players: Player[], playerId: string, role: CoupRole, deck: CoupRole[]): { newPlayers: Player[]; newDeck: CoupRole[] } {
+  let newRole: CoupRole = 'HIDDEN';
   let finalDeck = [...deck];
 
   const newPlayers = players.map(p => {
     if (p.id !== playerId) return p;
-    const roleIndex = p.influences.findIndex((i: any) => !i.isRevealed && i.role === role);
+    const roleIndex = p.influences.findIndex((i: Influence) => !i.isRevealed && i.role === role);
     if (roleIndex === -1) return p;
     
     const tempDeck = [...deck, p.influences[roleIndex].role];
@@ -296,9 +302,9 @@ function swapPlayerCard(players: any[], playerId: string, role: string, deck: st
   return { newPlayers, newDeck: finalDeck };
 }
 
-function moveToNextTurn(state: any) {
+function moveToNextTurn(state: GameState): GameState {
   const nextState = { ...state };
-  const alivePlayers = state.players.filter((p: any) => p.influences.some((i: any) => !i.isRevealed));
+  const alivePlayers = state.players.filter((p: Player) => p.influences.some((i: Influence) => !i.isRevealed));
 
   if (alivePlayers.length <= 1) {
     nextState.phase = 'GAME_OVER';
@@ -307,18 +313,18 @@ function moveToNextTurn(state: any) {
   }
 
   let activePlayerIndex = (state.activePlayerIndex + 1) % state.players.length;
-  while (!state.players[activePlayerIndex].influences.some((i: any) => !i.isRevealed)) {
+  while (!state.players[activePlayerIndex].influences.some((i: Influence) => !i.isRevealed)) {
     activePlayerIndex = (activePlayerIndex + 1) % state.players.length;
   }
   nextState.activePlayerIndex = activePlayerIndex;
   return nextState;
 }
 
-function resolveAction(state: any, dispatch?: (action: any) => void) {
+function resolveAction(state: GameState, dispatch?: (action: { type: string; timestamp?: number }) => void): GameState {
   if (!state.pendingAction) return state;
 
   const { type, actorId, targetId, blocks } = state.pendingAction;
-  let nextState = { ...state };
+  const nextState = { ...state };
   
   if (state.phase === 'WAITING_FOR_CHALLENGE' && CoupLogic.isBlockable(type) && !blocks) {
     const timestamp = Date.now();
@@ -376,7 +382,7 @@ function resolveAction(state: any, dispatch?: (action: any) => void) {
     nextState.lastMove = { ...state.lastMove, details };
     nextState.moveLog = [nextState.lastMove, ...state.moveLog.slice(1)];
     
-    const hasInfluences = target?.influences?.some((i: any) => !i.isRevealed);
+    const hasInfluences = target?.influences?.some((i: Influence) => !i.isRevealed);
     if (!hasInfluences) {
       nextState.players = nextPlayers;
       nextState.phase = 'PLAYING';
@@ -393,9 +399,9 @@ function resolveAction(state: any, dispatch?: (action: any) => void) {
   }
   else if (type === 'EXCHANGE') {
     details = `${actor.name} successfully used Exchange.`;
-    const unrevealedRoles = actor.influences.filter((i: any) => !i.isRevealed).map((i: any) => i.role);
+    const unrevealedRoles = actor.influences.filter((i: Influence) => !i.isRevealed).map((i: Influence) => i.role);
     const newDeck = [...state.deck];
-    const drawnRoles = [newDeck.shift(), newDeck.shift()];
+    const drawnRoles = [newDeck.shift()!, newDeck.shift()!];
     
     nextState.players = nextPlayers;
     nextState.lastMove = { ...state.lastMove, details };
