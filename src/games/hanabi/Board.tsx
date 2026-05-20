@@ -432,14 +432,14 @@ export default function HanabiBoard() {
 
                       {/* Show hint tags if the logic provides them in state (assuming hintColor/hintRank could exist) */}
                       <div className="absolute top-1 left-1 right-1 flex justify-between gap-1">
-                        {(card.hintColor || hasColor) && (
+                        {(card.hintedColor || hasColor) && (
                           <span
                             className={`w-3 h-3 md:w-4 md:h-4 rounded-full shadow-sm border border-outline/20 ${conf ? conf.bg : ""}`}
                           />
                         )}
-                        {(card.hintRank || hasRank) && (
+                        {(card.hintedRank || hasRank) && (
                           <span className="bg-surface/80 rounded px-1 font-label-md text-[8px] md:text-xs text-on-surface shadow-sm">
-                            {card.hintRank || card.rank}
+                            {card.hintedRank || card.rank}
                           </span>
                         )}
                       </div>
